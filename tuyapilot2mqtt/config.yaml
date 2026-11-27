@@ -1,5 +1,5 @@
 name: "tuyapilot2mqtt"
-version: "0.2.2"
+version: "0.2.3"
 slug: "tuyapilot2mqtt"
 description: "Tuya pilot-wire thermostats behind a Tuya gateway, published to Mosquitto in the Zigbee2MQTT dialect for the Tuya Pilot Wire Companion. Read only by default."
 url: "https://github.com/aghulas/tuyapilot2mqtt"
