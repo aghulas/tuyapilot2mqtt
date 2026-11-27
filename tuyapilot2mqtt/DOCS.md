@@ -5,18 +5,24 @@ gateway) to your MQTT broker in the **Zigbee2MQTT dialect**. It is the bridge th
 [Tuya Pilot Wire Companion](https://github.com/aghulas/ha-tuya-pilot-wire) reads. Unofficial: not
 affiliated with Tuya.
 
-**This version is read only.** It sends nothing to a thermostat: every command is answered by a
-refusal. It can run next to the stock `tuya` integration and next to any other reader.
+**Read only by default.** It sends nothing to a thermostat unless you open the single write of
+this version (the manual setpoint of one thermostat you designate, see
+[Writing](#writing-one-setpoint-one-thermostat)). It can run next to the stock `tuya` integration
+and next to any other reader.
 
 ## What it reads
 
-Through the gateway, on your local network (Tuya local protocol): on/off, mode, room temperature,
-manual setpoint, window state, fault, holiday / eco / frost setpoints, heating state, voltage,
-current, power and cumulative energy.
+Two channels, each for what it is proven to give:
 
-Not read yet (they need the Smart Life sharing API, not available in this version): window
-detection, child lock, temperature correction. The weekly schedule (developer API) is not
-available either. A value that was not read is **absent** from the published state, never guessed.
+- **Smart Life account** (the device-sharing API, the one Home Assistant's `tuya` integration
+  uses): on/off, mode, room temperature, manual setpoint, window state and detection, child lock,
+  temperature correction, holiday setpoint, fault. One request per read for all thermostats.
+- **The gateway, on your local network** (Tuya local protocol): heating state, voltage, current,
+  power, cumulative energy, eco and frost setpoints. While the account is not connected, the
+  gateway also gives everything else it returns.
+
+The weekly schedule (developer API) is not available yet. A value that was not read is **absent**
+from the published state, never guessed.
 
 ## Before you start
 
@@ -38,6 +44,40 @@ available either. A value that was not read is **absent** from the published sta
    local key requires a Tuya developer project today; the `tinytuya` documentation explains how.
    Keep the file out of any backup you share: it is a secret.
 3. **A fixed address for the gateway** (DHCP reservation in your router).
+4. For the account channel: the **user code** of your Smart Life app (Me → Settings → Account and
+   Security → User Code).
+
+## Connecting the Smart Life account
+
+1. Add `sharing` to `channels`, put the user code in `sharing_user_code`, restart the add-on.
+2. Open the add-on's **Log** tab: a QR code is printed. In the Smart Life app, tap the scan icon
+   and scan it, then confirm. A code is valid two minutes; the add-on prints a new one, up to
+   fifteen, then stops until you restart it.
+3. The log says `sharing channel: logged in`. The session is kept in the add-on's private storage
+   (`/data/sharing_session.json`) and renewed by the add-on; you scan once.
+
+Until you scan, the add-on keeps reading through the gateway and `bridge/info` says
+`"sharing": {"state": "waiting_for_scan"}` (or `login_required` while the user code is empty).
+The session is the add-on's own: it does not disturb the `tuya` integration or another client.
+The QR code is a short-lived login token: do not share a log that is less than a few minutes old.
+
+## Writing: one setpoint, one thermostat
+
+Closed by default. To open it:
+
+1. connect the Smart Life account (above);
+2. set `write_device` to the thermostat's name as published (or its Tuya device id);
+3. set `writes_enabled` to `true` and restart.
+
+`bridge/info` then says `"read_only": false`, and the bridge accepts
+`{"current_heating_setpoint": <value>}` on `tuyapilot2mqtt/<that thermostat>/set`, nothing else,
+on no other thermostat. The value must be within the device's own bounds (5 to 40 °C by 0.5) and
+not above 30 °C; the write is refused when the thermostat is offline or in frost protection. The
+command is sent once, the thermostat is read back, and the answer on
+`tuyapilot2mqtt/bridge/response/device/set` says `ok` only when the thermostat reports the value.
+The published state changes from that read-back, never from the request.
+
+Set `writes_enabled` back to `false` to close it. Each write and each refusal is in the log.
 
 ## Options
 
@@ -48,12 +88,17 @@ available either. A value that was not read is **absent** from the published sta
 | `mqtt_port` | `1883` | |
 | `mqtt_username`, `mqtt_password` | empty | |
 | `mqtt_tls` | `false` | |
-| `poll_interval` | `60` | Seconds between two reads of the gateway, 15 to 3600. The gateway accepts few local connections: do not go lower than you need, and raise it if another program reads the same gateway |
-| `channels` | `lan` | Channels to use. `sharing` and `developer` are accepted and reported as `unsupported` in this version |
+| `poll_interval` | `60` | Seconds between two reads of the gateway and of the account, 15 to 3600. The gateway accepts few local connections: do not go lower than you need, and raise it if another program reads the same gateway |
+| `channels` | `lan` | Channels to use: `lan`, `sharing`, `developer` |
 | `lan_host` | empty | **Required.** Address of the gateway |
 | `lan_keys_file` | `/homeassistant/tuyapilot2mqtt/devices.json` | Path of the keys file. `/homeassistant/` is your Home Assistant configuration folder, mounted read only |
 | `lan_version` | `3.3` | Tuya local protocol version of the gateway |
 | `lan_product_id` | `fu1bfwza` | Product assumed for the thermostats whose entry in the keys file has no `product_id`. Only `fu1bfwza` is supported |
+| `sharing_user_code` | empty | User code of the Smart Life app, for the QR-code login |
+| `sharing_session_file` | `/data/sharing_session.json` | Where the session is kept. Leave it |
+| `developer_access_id`, `developer_access_secret`, `developer_region` | empty, empty, `eu` | Tuya IoT platform project, for the `developer` channel. Without them the channel is reported `unavailable`. It only reads the eco and frost setpoints in this version |
+| `writes_enabled` | `false` | Opens the single write of this version |
+| `write_device` | empty | The one thermostat that can be written: its published name, or its Tuya device id |
 
 ## What it publishes
 
@@ -62,26 +107,28 @@ With the default prefix:
 | Topic | Content |
 |---|---|
 | `tuyapilot2mqtt/bridge/state` | `{"state": "online"}`; `offline` when the add-on stops or dies (last will) |
-| `tuyapilot2mqtt/bridge/info` | versions, `read_only`, state of each channel, number of thermostats answering |
+| `tuyapilot2mqtt/bridge/info` | versions, `read_only`, what is open for writing and why not, state of each channel |
 | `tuyapilot2mqtt/bridge/devices` | the list of thermostats |
 | `tuyapilot2mqtt/<name>` | state of a thermostat; `<name>` is its name in the Tuya app |
-| `tuyapilot2mqtt/<name>/availability` | `online`, or `offline` after three reads without an answer |
+| `tuyapilot2mqtt/<name>/availability` | `online`, or `offline` after ten minutes without a reading or when the account says the thermostat is offline |
 
 All retained. The full description is the
 [MQTT contract](https://github.com/aghulas/tuyapilot2mqtt/blob/main/docs/mqtt-contract.md).
 
 Commands (`tuyapilot2mqtt/<name>/set`, `tuyapilot2mqtt/bridge/request/…`) are answered on
-`tuyapilot2mqtt/bridge/response/…` with `"status": "error"` and a message saying the bridge is
-read only.
+`tuyapilot2mqtt/bridge/response/…`. Everything but the write described above gets
+`"status": "error"` and a message saying why; nothing is sent to a thermostat.
 
 The add-on creates **no entity** in Home Assistant by itself (no MQTT discovery): the entities are
 the Companion's.
 
 ## Checking that it works
 
-- The add-on's log says how many thermostats answered, each time that number changes:
-  `LAN: 6 of 6 thermostat(s) answered`. The log never contains a key, a device id or a name.
-- With an MQTT client, `tuyapilot2mqtt/bridge/info` shows `"lan": {"state": "online", …}`.
+- The add-on's log says the number of thermostats and the state of each channel, each time one
+  changes: `6 thermostat(s); channels: sharing ok, lan ok`. The log never contains a key, a
+  device id or a name.
+- With an MQTT client, `tuyapilot2mqtt/bridge/info` shows `"state": "online"` for each channel
+  you enabled.
 
 ## Troubleshooting
 
@@ -90,9 +137,13 @@ the Companion's.
 | `option 'lan_host': the gateway's address is required` | Fill `lan_host` |
 | `keys file not found` | Wrong `lan_keys_file`; the path starts with `/homeassistant/` |
 | `the keys file must hold exactly one gateway with its key` | The file has no entry with `sub` false and a `key`, or several |
-| `LAN: 0 of N thermostat(s) answered`, channel `offline` | Wrong address, wrong local key (it changes when the gateway is paired again), wrong protocol version, or the gateway is off the network |
+| `lan` channel `offline`, "no device answered" | Wrong address, wrong local key (it changes when the gateway is paired again), wrong protocol version, or the gateway is off the network |
 | Some thermostats miss a read from time to time | Another program reads the same gateway at the same moment; raise `poll_interval` |
 | A property is missing from a state | The gateway has not returned that data point since the add-on started, or the property is not read in this version |
+| `sharing` stays `login_required` | `sharing_user_code` is empty or refused by Tuya (the log says which) |
+| `sharing` is `login_expired` | Nobody scanned in thirty minutes: restart the add-on and scan |
+| `sharing` becomes `unauthenticated` then `waiting_for_scan` | The session was revoked (app sign-out, password change): scan again |
+| `read_only` stays `true` with `writes_enabled` | `bridge/info.writes.closed` gives the reason |
 
 ## Outside Home Assistant
 

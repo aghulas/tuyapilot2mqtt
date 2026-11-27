@@ -1,7 +1,7 @@
 name: "tuyapilot2mqtt"
-version: "0.1.1"
+version: "0.2.0"
 slug: "tuyapilot2mqtt"
-description: "Tuya pilot-wire thermostats behind a Tuya gateway, published to Mosquitto in the Zigbee2MQTT dialect for the Tuya Pilot Wire Companion. Read only."
+description: "Tuya pilot-wire thermostats behind a Tuya gateway, published to Mosquitto in the Zigbee2MQTT dialect for the Tuya Pilot Wire Companion. Read only by default."
 url: "https://github.com/aghulas/tuyapilot2mqtt"
 arch:
   - aarch64
@@ -28,6 +28,13 @@ options:
   lan_keys_file: "/homeassistant/tuyapilot2mqtt/devices.json"
   lan_version: "3.3"
   lan_product_id: "fu1bfwza"
+  sharing_user_code: ""
+  sharing_session_file: "/data/sharing_session.json"
+  developer_access_id: ""
+  developer_access_secret: ""
+  developer_region: "eu"
+  writes_enabled: false
+  write_device: ""
 schema:
   base_topic: str
   mqtt_host: str?
@@ -42,3 +49,10 @@ schema:
   lan_keys_file: str?
   lan_version: list(3.3|3.4|3.5)?
   lan_product_id: str?
+  sharing_user_code: password?
+  sharing_session_file: str?
+  developer_access_id: password?
+  developer_access_secret: password?
+  developer_region: list(eu|us|cn|in|sg)?
+  writes_enabled: bool
+  write_device: str?

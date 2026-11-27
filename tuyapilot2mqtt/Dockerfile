@@ -4,12 +4,12 @@ FROM ${BUILD_FROM}
 WORKDIR /app
 
 # pytuya-pilot-wire holds everything that knows Tuya. It is not on PyPI yet: pinned here by tag
-# or commit of its repository (a tarball, so the image needs no git).
-ARG PYTUYA_PILOT_WIRE_REF="47090b2c9dcf8302d8deb8c378436c818c3f514e"
+# of its repository (a tarball, so the image needs no git).
+ARG PYTUYA_PILOT_WIRE_REF="v0.2.0"
 COPY pyproject.toml /app/
 COPY src /app/src
 RUN pip install --no-cache-dir \
-       "pytuya-pilot-wire @ https://github.com/aghulas/pytuya-pilot-wire/archive/${PYTUYA_PILOT_WIRE_REF}.tar.gz" \
+       "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ https://github.com/aghulas/pytuya-pilot-wire/archive/refs/tags/${PYTUYA_PILOT_WIRE_REF}.tar.gz" \
     && pip install --no-cache-dir /app \
     && rm -rf /app/src /app/pyproject.toml /app/build
 
