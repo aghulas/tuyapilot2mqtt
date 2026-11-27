@@ -1,5 +1,5 @@
 name: "tuyapilot2mqtt"
-version: "0.2.0"
+version: "0.2.1"
 slug: "tuyapilot2mqtt"
 description: "Tuya pilot-wire thermostats behind a Tuya gateway, published to Mosquitto in the Zigbee2MQTT dialect for the Tuya Pilot Wire Companion. Read only by default."
 url: "https://github.com/aghulas/tuyapilot2mqtt"
@@ -11,6 +11,9 @@ startup: services
 boot: auto
 services:
   - mqtt:want
+# The page of the Smart Life QR-code login ("Open web UI"); reachable through Home Assistant only.
+ingress: true
+ingress_port: 8099
 map:
   - type: homeassistant_config
     read_only: true

@@ -10,7 +10,7 @@ import pytest
 from pytuya_pilot_wire.errors import ChannelError, WriteRefused
 from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, Reading
 
-from tuyapilot2mqtt import CONTRACT_VERSION, cli, config, contract, devices, session
+from tuyapilot2mqtt import CONTRACT_VERSION, __version__, cli, config, contract, devices, session
 from tuyapilot2mqtt.bridge import Bridge, TrialGate
 
 ENTRIES = [
@@ -190,7 +190,7 @@ def test_lan_alone_publishes_every_property_it_read() -> None:
 
     assert transport.last("Room A/availability") == {"state": "online"}
     info = transport.last("bridge/info")
-    assert info["version"] == "0.2.0" and info["contract"] == CONTRACT_VERSION == 3
+    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 3
     assert info["read_only"] is True
     assert info["writes"] == {
         "enabled": False, "keys": ["current_heating_setpoint"], "device": None,
@@ -533,7 +533,8 @@ def test_login_renews_the_code_then_gives_up() -> None:
     for _ in range(session.MAX_QR_CODES + 3):
         login.tick()
         clock.now += session.QR_LIFETIME
-    assert len(shown) == session.MAX_QR_CODES and login.state == session.LOGIN_EXPIRED
+    assert [q for q in shown if q] == ["qr"] * session.MAX_QR_CODES and shown[-1] is None
+    assert login.state == session.LOGIN_EXPIRED
 
 
 def test_login_says_when_the_code_request_fails() -> None:
@@ -543,6 +544,50 @@ def test_login_says_when_the_code_request_fails() -> None:
     login = session.Login("code", request=refuse, poll=lambda qr, code: None, clock=Clock())
     assert login.tick() is None
     assert login.state == session.LOGIN_REQUIRED and "ChannelError" in login.detail
+
+
+def test_login_page_shows_the_code_only_while_waiting() -> None:
+    page = session.LoginPage(0)
+    page.update(session.WAITING_FOR_SCAN, "")
+    page.show("tuyaSmart--qrLogin?token=synthetic")
+    shown = page.render()
+    assert "<svg" in shown and "synthetic" not in shown and "<script" not in shown
+    page.update("online")
+    assert "<svg" not in page.render() and "Connected" in page.render()
+    page.update(session.WAITING_FOR_SCAN)
+    assert "<svg" not in page.render()  # the old code is not shown again
+
+
+def test_login_page_answers_the_ingress_proxy_only() -> None:
+    import urllib.error
+    import urllib.request
+
+    page = session.LoginPage(0, allowed=("192.0.2.1",), host="127.0.0.1")
+    page.start()
+    try:
+        port = page._server.server_address[1]
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f"http://127.0.0.1:{port}/", timeout=5)
+        assert refused.value.code == 403
+        page.allowed = ("127.0.0.1",)
+        page.update(session.WAITING_FOR_SCAN)
+        page.show("tuyaSmart--qrLogin?token=synthetic")
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/anything", timeout=5) as answer:
+            assert answer.headers["Cache-Control"] == "no-store" and b"<svg" in answer.read()
+    finally:
+        page.stop()
+
+
+def test_login_clears_the_shown_code_once_logged_in() -> None:
+    clock = Clock()
+    shown: list[Any] = []
+    login = session.Login(
+        "code", request=lambda code: "qr", poll=lambda qr, code: "s", show=shown.append, where="here", clock=clock
+    )
+    login.tick()
+    assert "here" in login.detail
+    clock.now += session.POLL_INTERVAL
+    assert login.tick() == "s" and shown == ["qr", None]
 
 
 def test_no_session_refuses_every_call() -> None:

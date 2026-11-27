@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.1
+
+MQTT contract version 3, unchanged.
+
+- **The QR code of the Smart Life login is on the add-on's own page** ("Open web UI", through
+  Home Assistant's ingress), no longer in the log. The page refreshes by itself and shows the next
+  code when one expires. The log only says that a code is waiting; neither the code nor its text
+  is written there any more (0.2.0 wrote the text of the login token). Outside Home Assistant,
+  without that page, the code is still printed in the log, as a picture only.
+
 ## 0.2.0
 
 MQTT contract version 3. Built on `pytuya-pilot-wire` 0.2.0 (channels, router, write gate, daemon

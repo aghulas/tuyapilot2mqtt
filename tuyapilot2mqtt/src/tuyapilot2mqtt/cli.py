@@ -6,6 +6,7 @@ import argparse
 import contextlib
 import json
 import logging
+import os
 import signal
 import sys
 import threading
@@ -19,7 +20,7 @@ from .bridge import Bridge
 from .config import ConfigError, Settings, load
 from .devices import DevicesError, LocalInventory
 from .devices import load as load_devices
-from .session import Login, NoSession, SessionStore
+from .session import Login, LoginPage, NoSession, SessionStore
 
 log = logging.getLogger("tuyapilot2mqtt")
 
@@ -155,6 +156,33 @@ def _mqtt_client(settings: Settings) -> Any:
     return client
 
 
+# Port of the login page behind Home Assistant's ingress, set by run.sh in the add-on. Unset (outside
+# Home Assistant): no page, the QR code is printed in the log.
+INGRESS_PORT_ENV = "TUYAPILOT_INGRESS_PORT"
+
+
+def _login_page() -> LoginPage | None:
+    raw = os.environ.get(INGRESS_PORT_ENV, "").strip()
+    if not raw or raw == "0":
+        return None
+    try:
+        page = LoginPage(int(raw))
+        page.start()
+    except (OSError, ValueError) as err:
+        log.warning("login page unavailable (%s): the QR code goes to the log", type(err).__name__)
+        return None
+    return page
+
+
+def _sharing_state(bridge: Any, login: Login | None) -> tuple[str, str]:
+    status = bridge.status.get(Channel.SHARING)
+    if status is None:
+        return "disabled", ""
+    if status.state == "unauthenticated" and login is not None:
+        return login.state, login.detail
+    return status.state, ""
+
+
 def run(settings: Settings) -> int:
     from pytuya_pilot_wire.mqtt import PahoTransport
 
@@ -216,6 +244,7 @@ def run(settings: Settings) -> int:
         settings.poll_interval,
         "enabled in the options (one key, one thermostat)" if settings.writes_enabled else "disabled",
     )
+    page = _login_page() if "sharing" in settings.channels else None
     client.connect_async(settings.mqtt_host, settings.mqtt_port, keepalive=60)
     client.loop_start()
     bridge.start()
@@ -233,7 +262,17 @@ def run(settings: Settings) -> int:
                     if login is None:
                         from pytuya_pilot_wire.channels.sharing import poll_login, request_qr_code
 
-                        login = Login(settings.sharing_user_code, request=request_qr_code, poll=poll_login)
+                        login = (
+                            Login(settings.sharing_user_code, request=request_qr_code, poll=poll_login)
+                            if page is None
+                            else Login(
+                                settings.sharing_user_code,
+                                request=request_qr_code,
+                                poll=poll_login,
+                                show=page.show,
+                                where="on the add-on's page (Open web UI)",
+                            )
+                        )
                     before = (login.state, login.detail)
                     session = login.tick()
                     if session is not None:
@@ -242,6 +281,8 @@ def run(settings: Settings) -> int:
                         login = None
                     elif (login.state, login.detail) != before:
                         bridge.publish_info()
+                if page is not None:
+                    page.update(*_sharing_state(bridge, login))
             except Exception as err:  # one bad turn must not take the thermostats offline
                 log.error("loop error (%s), continuing", type(err).__name__)
                 stop.wait(5)
@@ -254,6 +295,8 @@ def run(settings: Settings) -> int:
                     ", ".join(f"{c.value} {s.state}" for c, s in bridge.status.items()) or "none",
                 )
     finally:
+        if page is not None:
+            page.stop()
         info = client.publish(
             f"{settings.base_topic}/bridge/state", json.dumps({"state": "offline"}), qos=1, retain=True
         )
