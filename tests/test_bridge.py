@@ -12,10 +12,13 @@ from tuyapilot2mqtt.lan import LanChannel
 
 ENTRIES = [
     {"id": "gw", "key": "k" * 16, "name": "Gateway", "category": "wg2", "sub": False},
-    {"id": "b", "key": "", "name": "Room/B #1", "category": "wk", "sub": True, "node_id": "nb"},
+    {"id": "b", "key": "", "name": "Room/B #1", "category": "wk", "sub": True, "node_id": "A4C1380000000ABC"},
     {"id": "a", "key": "", "name": "Room A", "category": "wk", "sub": True, "node_id": "na", "product_id": "fu1bfwza"},
     {"id": "x", "key": "", "name": "Plug", "category": "cz", "sub": True, "node_id": "nx"},
 ]
+
+
+NODES = {"nb": "A4C1380000000ABC"}
 
 
 class Clock:
@@ -28,7 +31,7 @@ class Clock:
 def make(readings: dict, channels: tuple[str, ...] = ("lan",)) -> tuple[Bridge, Clock]:
     clock = Clock()
     gateway, thermostats = devices.parse(ENTRIES, "fu1bfwza")
-    lan = LanChannel(gateway, thermostats, lambda _g, _t: readings, clock)
+    lan = LanChannel(gateway, thermostats, lambda _g, _t: {NODES.get(k, k): v for k, v in readings.items()}, clock)
     return Bridge(config.Settings(channels=channels), thermostats, lan, clock), clock
 
 
@@ -43,6 +46,9 @@ def test_devices_from_keys_file() -> None:
     assert [t.friendly_name for t in thermostats] == ["Room A", "Room B 1"]
     assert [t.product_id_source for t in thermostats] == ["file", "config"]
     descriptor = thermostats[0].descriptor()
+    assert "ieee_address" not in descriptor  # "na" is not an EUI-64
+    assert thermostats[1].descriptor()["ieee_address"] == "0xa4c1380000000abc"
+    assert descriptor["definition"]["model"] == "TS0601_fu1bfwza"
     assert descriptor["supported"] is True
     assert descriptor["tuya"] == {
         "dev_id": "a",
@@ -89,9 +95,9 @@ def test_full_reading_while_heating() -> None:
            "101": 2305, "102": 4300, "107": 1234, "116": 70, "117": 160, "124": "opened"}  # fmt: skip
     bridge, _ = make({"na": dps})
     state = by_topic(bridge.poll())["tuyapilot2mqtt/Room A"]
-    assert state["system_mode"] == "heat" and state["preset"] == "schedule"
+    assert state["system_mode"] == "heat" and state["preset"] == "program"
     assert state["current_heating_setpoint"] == 20.5 and state["holiday_temperature"] == 12.0
-    assert state["frost_protection_temperature"] == 7.0 and state["eco_temperature"] == 16.0
+    assert state["antifrost_temperature"] == 7.0 and state["eco_temperature"] == 16.0
     assert state["window_open"] is True and state["fault"] == ["bit_0", "bit_2"]
     assert state["running_state"] == "heat"
     assert state["voltage"] == 230.5 and state["current"] == 4.3 and state["power"] == 991.1

@@ -4,7 +4,7 @@ A daemon around ``pytuya-pilot-wire``: it holds the sessions and keys, reads, an
 topics of ``docs/mqtt-contract.md``. Read only in this version.
 """
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 
 # Version of docs/mqtt-contract.md this code publishes (``bridge/info.contract``).
-CONTRACT_VERSION = 1
+CONTRACT_VERSION = 2
