@@ -1,5 +1,22 @@
 # Changelog
 
+## 0.3.0
+
+MQTT contract **version 5**. Built on `pytuya-pilot-wire` 0.3.0, pinned by tag.
+
+- **`preset` is writable, `manual` and `program` only.** `eco`, `holiday` and frost protection
+  are refused with nothing sent (the library's gate refuses them too). Written through the sharing
+  API, sent once, read back: `ok` only when the thermostat reports the mode.
+- **Several designated thermostats.** The option `write_devices` (a list of published names or
+  Tuya device ids) replaces `write_device`; `bridge/info.writes.devices` lists those found, and
+  `writes.keys` is `["current_heating_setpoint", "preset"]`. `writes.device` stays, the first of
+  `devices`. A 0.2.x `write_device` option is ignored: list the thermostat in `write_devices`.
+- **Rate limit per thermostat**: one write every 10 s and 30 an hour, counted on what was sent;
+  above it the command is refused with the delay in the answer.
+- **One key per command**: a `/set` carrying two keys is refused with nothing sent. Send
+  `preset: manual`, then the setpoint, then `preset: program`.
+- The setpoint is still written only in `manual` mode.
+
 ## 0.2.3
 
 MQTT contract version 4, unchanged. Built on `pytuya-pilot-wire` 0.2.2, pinned by tag.

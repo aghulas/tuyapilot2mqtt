@@ -5,10 +5,10 @@ gateway) to your MQTT broker in the **Zigbee2MQTT dialect**. It is the bridge th
 [Tuya Pilot Wire Companion](https://github.com/aghulas/ha-tuya-pilot-wire) reads. Unofficial: not
 affiliated with Tuya.
 
-**Read only by default.** It sends nothing to a thermostat unless you open the single write of
-this version (the manual setpoint of one thermostat you designate, see
-[Writing](#writing-one-setpoint-one-thermostat)). It can run next to the stock `tuya` integration
-and next to any other reader.
+**Read only by default.** It sends nothing to a thermostat unless you open the writes of this
+version (preset `manual` / `program` and the manual setpoint, on the thermostats you designate,
+see [Writing](#writing-preset-and-setpoint-on-designated-thermostats)). It must be the only client
+of the Smart Life account (disable the stock `tuya` integration).
 
 ## What it reads
 
@@ -69,23 +69,30 @@ channel turns `unauthenticated` and a new QR code appears on the page.
 The QR code is a short-lived login token: it is never written in the log, and the page answers
 Home Assistant's ingress only; do not share a screenshot of it.
 
-## Writing: one setpoint, one thermostat
+## Writing: preset and setpoint on designated thermostats
 
 Closed by default. To open it:
 
 1. connect the Smart Life account (above);
-2. set `write_device` to the thermostat's name as published (or its Tuya device id);
+2. list in `write_devices` the thermostats that can be written: their names as published (or
+   their Tuya device ids);
 3. set `writes_enabled` to `true` and restart.
 
-`bridge/info` then says `"read_only": false`, and the bridge accepts
-`{"current_heating_setpoint": <value>}` on `tuyapilot2mqtt/<that thermostat>/set`, nothing else,
-on no other thermostat. The value must be within the device's own bounds (5 to 40 °C by 0.5) and
-not above 30 °C; the write is refused when the thermostat is offline or in any mode but `manual`
-(`program`, `eco`, `holiday`, frost protection). In `program` mode the thermostat replaces a
-written setpoint with the one of the running schedule slot, so put the thermostat in `manual` in
-the Smart Life app first, and back afterwards. The command is sent once, the thermostat is read back, and the answer on
-`tuyapilot2mqtt/bridge/response/device/set` says `ok` only when the thermostat reports the value.
-The published state changes from that read-back, never from the request.
+`bridge/info` then says `"read_only": false` and lists them in `writes.devices`. On
+`tuyapilot2mqtt/<one of them>/set` the bridge accepts, one key per command:
+
+- `{"preset": "manual"}` or `{"preset": "program"}` (`eco`, `holiday`, frost protection are
+  refused);
+- `{"current_heating_setpoint": <value>}`, within the device's own bounds (5 to 40 °C by 0.5) and
+  not above 30 °C, only while the thermostat is in `manual`: in `program` mode the thermostat
+  replaces a written setpoint with the one of the running schedule slot. Send
+  `{"preset": "manual"}` first, and `{"preset": "program"}` afterwards.
+
+Nothing else, on no other thermostat. A write is refused when the thermostat is offline, and
+above **one write every 10 s and 30 an hour** per thermostat. The command is sent once, the
+thermostat is read back, and the answer on `tuyapilot2mqtt/bridge/response/device/set` says `ok`
+only when the thermostat reports the value. The published state changes from that read-back,
+never from the request.
 
 Set `writes_enabled` back to `false` to close it. Each write and each refusal is in the log,
 with the raw command sent (data-point code and raw value, never an id or a key).
@@ -108,8 +115,8 @@ with the raw command sent (data-point code and raw value, never an id or a key).
 | `sharing_user_code` | empty | User code of the Smart Life app, for the QR-code login |
 | `sharing_session_file` | `/data/sharing_session.json` | Where the session is kept. Leave it |
 | `developer_access_id`, `developer_access_secret`, `developer_region` | empty, empty, `eu` | Tuya IoT platform project, for the `developer` channel. Without them the channel is reported `unavailable`. It only reads the eco and frost setpoints in this version |
-| `writes_enabled` | `false` | Opens the single write of this version |
-| `write_device` | empty | The one thermostat that can be written: its published name, or its Tuya device id |
+| `writes_enabled` | `false` | Opens the writes of this version on the thermostats of `write_devices` |
+| `write_devices` | empty | The thermostats that can be written: their published names, or their Tuya device ids (replaces `write_device` of 0.2.x) |
 
 ## What it publishes
 
@@ -127,7 +134,7 @@ All retained. The full description is the
 [MQTT contract](https://github.com/aghulas/tuyapilot2mqtt/blob/main/docs/mqtt-contract.md).
 
 Commands (`tuyapilot2mqtt/<name>/set`, `tuyapilot2mqtt/bridge/request/…`) are answered on
-`tuyapilot2mqtt/bridge/response/…`. Everything but the write described above gets
+`tuyapilot2mqtt/bridge/response/…`. Everything but the writes described above gets
 `"status": "error"` and a message saying why; nothing is sent to a thermostat.
 
 The add-on creates **no entity** in Home Assistant by itself (no MQTT discovery): the entities are
