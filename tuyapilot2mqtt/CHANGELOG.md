@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.2
+
+MQTT contract version 4. Built on `pytuya-pilot-wire` 0.2.1, pinned by tag.
+
+- **The setpoint is written only in `manual` mode.** A `current_heating_setpoint` command is
+  refused, with nothing sent, when the designated thermostat is in `program`, `eco`, `holiday` or
+  frost protection, or while its mode is not known; the bridge checks the mode it holds, and the
+  library's gate checks it again on the read made just before sending. In `program` mode the
+  thermostat replaces a written setpoint with the one of the running schedule slot: the write was
+  sent, then answered `not confirmed`, and nothing changed (seen on real hardware).
+- The log gives the raw command actually sent (data-point code and raw value, e.g.
+  `temp_set=95`), never an id or a key.
+
 ## 0.2.1
 
 MQTT contract version 3, unchanged.
