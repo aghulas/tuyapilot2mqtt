@@ -13,5 +13,9 @@ if [ -z "${MQTT_HOST}" ] && bashio::services.available "mqtt"; then
     bashio::log.info "Using Home Assistant Mosquitto service at ${TUYAPILOT_MQTT_HOST}:${TUYAPILOT_MQTT_PORT}"
 fi
 
+# The page that shows the QR code of the Smart Life login, behind Home Assistant's ingress.
+TUYAPILOT_INGRESS_PORT="$(bashio::addon.ingress_port)"
+export TUYAPILOT_INGRESS_PORT
+
 bashio::log.info "Starting tuyapilot2mqtt bridge..."
 exec tuyapilot2mqtt --options /data/options.json

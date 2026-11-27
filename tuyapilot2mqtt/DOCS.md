@@ -49,17 +49,21 @@ from the published state, never guessed.
 
 ## Connecting the Smart Life account
 
-1. Add `sharing` to `channels`, put the user code in `sharing_user_code`, restart the add-on.
-2. Open the add-on's **Log** tab: a QR code is printed. In the Smart Life app, tap the scan icon
-   and scan it, then confirm. A code is valid two minutes; the add-on prints a new one, up to
-   fifteen, then stops until you restart it.
-3. The log says `sharing channel: logged in`. The session is kept in the add-on's private storage
-   (`/data/sharing_session.json`) and renewed by the add-on; you scan once.
+1. In the add-on's **Configuration** tab, put the user code in `sharing_user_code` and add
+   `sharing` to `channels`, then save: the add-on restarts.
+2. Open the add-on's page: **Open web UI** on the add-on's Info tab. It shows a QR code. In the
+   Smart Life app, tap the scan icon of the home screen, scan the code, then confirm in the app. A
+   code is valid two minutes; the page shows the next one by itself, up to fifteen, then the
+   add-on stops asking until you restart it.
+3. The page says **Connected**, and the log `sharing channel: logged in`. The session is kept in
+   the add-on's private storage (`/data/sharing_session.json`) and renewed by the add-on; you scan
+   once.
 
 Until you scan, the add-on keeps reading through the gateway and `bridge/info` says
 `"sharing": {"state": "waiting_for_scan"}` (or `login_required` while the user code is empty).
 The session is the add-on's own: it does not disturb the `tuya` integration or another client.
-The QR code is a short-lived login token: do not share a log that is less than a few minutes old.
+The QR code is a short-lived login token: it is never written in the log, and the page answers
+Home Assistant's ingress only; do not share a screenshot of it.
 
 ## Writing: one setpoint, one thermostat
 
@@ -142,6 +146,7 @@ the Companion's.
 | A property is missing from a state | The gateway has not returned that data point since the add-on started, or the property is not read in this version |
 | `sharing` stays `login_required` | `sharing_user_code` is empty or refused by Tuya (the log says which) |
 | `sharing` is `login_expired` | Nobody scanned in thirty minutes: restart the add-on and scan |
+| **Open web UI** shows no code | The `sharing` channel is not in `channels`, or the stored session works (the page says Connected) |
 | `sharing` becomes `unauthenticated` then `waiting_for_scan` | The session was revoked (app sign-out, password change): scan again |
 | `read_only` stays `true` with `writes_enabled` | `bridge/info.writes.closed` gives the reason |
 

@@ -70,7 +70,7 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
   | `offline` | the last call failed; `error` says how; retried with a growing delay, 15 minutes at most |
   | `unauthenticated` | the credentials were refused; the channel is paused |
   | `login_required` | sharing channel without a session, and no login can start (`error` says what is missing) |
-  | `waiting_for_scan` | sharing channel: a QR code is shown in the bridge's log, waiting for the owner to scan it with the Smart Life app |
+  | `waiting_for_scan` | sharing channel: a QR code is shown by the bridge (the add-on's page; its log outside Home Assistant), waiting for the owner to scan it with the Smart Life app |
   | `login_expired` | sharing channel: nobody scanned in time; the bridge shows a new code when it restarts |
   | `unavailable` | enabled in the options but not usable (`error`: credentials missing) |
 
