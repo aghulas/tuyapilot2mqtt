@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# The library pinned by the image; the tests install the same one.
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install (library at the ref pinned in the Dockerfile)
+        run: |
+          ref="$(sed -n 's/^ARG PYTUYA_PILOT_WIRE_REF="\(.*\)"$/\1/p' tuyapilot2mqtt/Dockerfile)"
+          test -n "$ref"
+          pip install "pytuya-pilot-wire @ https://github.com/aghulas/pytuya-pilot-wire/archive/${ref}.tar.gz"
+          pip install -e "./tuyapilot2mqtt[dev]"
+
+      - name: Lint
+        working-directory: tuyapilot2mqtt
+        run: ruff check . ../tests
+
+      - name: Tests (manifests, contract version, daemon)
+        working-directory: tuyapilot2mqtt
+        run: pytest -q
+
+      - name: Shellcheck run.sh
+        run: shellcheck -x tuyapilot2mqtt/run.sh
+
+      - name: Build Docker image & smoke-test CLI
+        run: |
+          docker build -t tuyapilot2mqtt:ci ./tuyapilot2mqtt
+          docker run --rm --entrypoint tuyapilot2mqtt tuyapilot2mqtt:ci --dry-run
+
+      - name: docker-compose.yml is valid
+        run: TUYAPILOT_LAN_HOST=192.0.2.1 docker compose config --quiet
