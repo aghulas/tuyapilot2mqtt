@@ -1,7 +1,8 @@
 # MQTT contract
 
-Contract version: **4** (2026-11-27). Published by `tuyapilot2mqtt` 0.2.2 and later: sharing API and LAN
-channels, **read only unless the owner opens the single write of this version** (§4). The same
+Contract version: **5** (2026-11-27). Published by `tuyapilot2mqtt` 0.3.0 and later: sharing API and LAN
+channels, **read only unless the owner opens the writes of this version** (§4) on the thermostats
+it designates. The same
 number is in `bridge/info.contract`; it is incremented at every change of this document that a
 reader of the topics can observe. History: [§7](#7-versions).
 
@@ -39,12 +40,12 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
 
 ```json
 {
-  "version": "0.2.3",
-  "contract": 4,
-  "library": {"name": "pytuya-pilot-wire", "version": "0.2.2"},
+  "version": "0.3.0",
+  "contract": 5,
+  "library": {"name": "pytuya-pilot-wire", "version": "0.3.0"},
   "read_only": true,
-  "writes": {"enabled": false, "keys": ["current_heating_setpoint"], "device": null,
-             "closed": "writes are disabled in the options"},
+  "writes": {"enabled": false, "keys": ["current_heating_setpoint", "preset"], "devices": [],
+             "device": null, "closed": "writes are disabled in the options"},
   "poll_interval": 60,
   "channels": {
     "sharing": {"enabled": true, "state": "online", "last_ok": "2026-11-27T14:08:26Z"},
@@ -55,12 +56,15 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
 ```
 
 - `read_only` is `false` only when a write can really pass: the owner enabled writes in the
-  bridge's options, designated one thermostat, that thermostat is among the devices, and the
-  sharing channel is connected. In every other case it is `true` and every command is refused
-  (§4). A reader that offers a write control must follow this flag.
+  bridge's options, designated thermostats (`write_devices`), at least one of them is among the
+  devices, and the sharing channel is connected. In every other case it is `true` and every
+  command is refused (§4). A reader that offers a write control must follow this flag, and offer
+  it only on the thermostats of `writes.devices`.
 - `writes` says why: `enabled` is the option, `keys` the `/set` keys this version can open,
-  `device` the friendly name of the designated thermostat (`null` when none or unknown), and
-  `closed` the reason no write passes now (absent when `read_only` is `false`).
+  `devices` the friendly names of the designated thermostats found among the devices (in the
+  order of their names; empty when none), `device` the first of them or `null` (kept for readers
+  of version 4, which had a single designated thermostat), and `closed` the reason no write
+  passes now (absent when `read_only` is `false`).
 - A channel's `state`, when it is `enabled`:
 
   | State | Meaning |
@@ -183,22 +187,31 @@ Extension object `tuya` in the state, for what has no Zigbee2MQTT equivalent:
 
 ## 4. Commands (`<prefix>/<friendly_name>/set`)
 
-**One write in this version, closed by default**: `current_heating_setpoint`, on the single
-thermostat the owner designates in the bridge's options, for its supervised trial (milestone M4),
-and **only while that thermostat is in `manual` mode** (`preset: "manual"`). Whether it is open
-is `bridge/info.read_only` (§1.1); the mode is not part of `read_only`, it is checked per command.
+**Two writes in this version, closed by default**, on the thermostats the owner designates in the
+bridge's options (`write_devices`), **one key per command**:
+
+| Key | Values | Condition |
+|---|---|---|
+| `preset` | `"manual"` or `"program"` | any mode; `eco`, `holiday` and `antifrost` are refused |
+| `current_heating_setpoint` | °C, the device's bounds and step, 30 °C at most | the thermostat is in `manual` (`preset: "manual"`) |
+
+Whether they are open is `bridge/info.read_only` and `bridge/info.writes.devices` (§1.1); the mode
+is not part of `read_only`, it is checked per command.
 
 ```json
-{"current_heating_setpoint": 19.5, "transaction": "<optional, echoed in the response>"}
+{"preset": "manual", "transaction": "<optional, echoed in the response>"}
+{"current_heating_setpoint": 19.5, "transaction": "<optional>"}
 ```
 
 `transaction` is an identifier, not a command key. **Every** `/set` is answered on
-`<prefix>/bridge/response/device/set` (not retained).
+`<prefix>/bridge/response/device/set` (not retained). A reader that wants a manual setpoint sends
+`preset: "manual"`, waits for its answer, then sends the setpoint; to give the thermostat back
+to its weekly schedule, it sends `preset: "program"`.
 
-A command the bridge refuses without looking at its values — read-only bridge, unknown device,
-another key (alone or next to the open one), another thermostat than the designated one, a
-thermostat whose last published `preset` is not `manual` or whose mode is not known yet — sends
-nothing to the device and is answered:
+A command the bridge refuses without sending anything — read-only bridge, unknown device, no key,
+two keys, a key other than the two above, a thermostat that is not designated, a `preset` other
+than `manual` or `program`, a setpoint for a thermostat whose last published `preset` is not
+`manual` or whose mode is not known yet, a write over the rate limit — is answered:
 
 ```json
 {"status": "error",
@@ -207,17 +220,23 @@ nothing to the device and is answered:
  "transaction": "<echoed when the command carried one>"}
 ```
 
+**Rate limit**, per thermostat, on the commands actually sent: one every 10 s and 30 an hour.
+Above it the command is refused, nothing sent, and `error` says when to retry:
+`"rate limit: one write every 10 s and 30 an hour per thermostat; retry in 4 s; nothing was sent to the device"`.
+A command refused before sending is not counted.
+
 A command that passes goes through the library's write gate, in this order: the value is checked
-against **the device's own bounds and step** (5 to 40 °C by 0.5 on this product) and against a
-**30 °C ceiling** the bridge adds; the device is read, and the write is refused when it is offline
-or in any mode but `manual` (see below); the command is sent **once**,
-never retried; the device is read back, every 2 s for 20 s at most. The state object is
-republished from that read-back, then the response is published:
+against **the device's own bounds and step** (5 to 40 °C by 0.5 on this product) and a **30 °C
+ceiling** the bridge adds, or against the modes the device declares and the two this version
+opens; the device is read, and the write is refused when it is offline or, for a setpoint, in
+any mode but `manual` (see below); the command is sent **once**, never retried; the device is
+read back, every 2 s for 20 s at most. The state object is republished from that read-back, then
+the response is published:
 
 ```json
 {"status": "ok",
  "data": {"device": "<friendly_name>",
-          "results": [{"property": "current_heating_setpoint", "value": 19.5, "confirmed": true}]},
+          "results": [{"property": "preset", "value": "manual", "confirmed": true}]},
  "transaction": "<echoed>"}
 ```
 
@@ -227,16 +246,14 @@ with the reason in `error`; `results` is then empty or says which write was not 
 response comes within about 30 s of the command (a command that arrives during a read pass waits
 for it); a reader should allow 45 s.
 
-**Why `manual` only.** In `program` mode the thermostat follows its weekly schedule: a written
-setpoint is accepted by the account, then replaced within seconds by the setpoint of the running
-schedule slot, so the read-back never shows the value and the command is answered
-`"confirmed": false` with nothing changed. This was observed on real hardware during the first
-supervised trial (a setpoint sent once to a thermostat in `program`, read back at the slot's
-value). In `antifrost` the device stores a written setpoint and does not apply it; in `eco` and
-`holiday` it follows the setpoint of that mode, and nothing shows a written one would be kept.
-A reader that wants a manual setpoint puts the thermostat in `manual` first (in the vendor app in
-this version, since `preset` is not writable yet) and restores its mode afterwards. The refusal
-names the mode:
+**Why `manual` only for the setpoint.** In `program` mode the thermostat follows its weekly
+schedule: a written setpoint is accepted by the account, then replaced within seconds by the
+setpoint of the running schedule slot, so the read-back never shows the value and the command is
+answered `"confirmed": false` with nothing changed. This was observed on real hardware during the
+first supervised trial (a setpoint sent once to a thermostat in `program`, read back at the
+slot's value). In `antifrost` the device stores a written setpoint and does not apply it; in
+`eco` and `holiday` it follows the setpoint of that mode, and nothing shows a written one would
+be kept. The refusal names the mode:
 
 ```json
 {"status": "error",
@@ -247,13 +264,19 @@ names the mode:
 The gate reads the mode again just before sending: a thermostat that left `manual` since the last
 published state is refused there, with `results` empty and nothing sent.
 
-Routes of the other commands, for the later steps of M4. None is accepted in this version.
+**Why `manual` and `program` only for the preset.** They are the two modes a room needs (a
+manual setpoint, then back to the schedule). In `eco` and `holiday` the thermostat follows a
+setpoint that has no proven write route (`eco_temperature`) or a holiday period the bridge does
+not set; `antifrost` is not a mode the device declares, and has no route.
+
+Routes of the commands:
 
 | Command | Route | State |
 |---|---|---|
-| `{"current_heating_setpoint": 19.5}` | sharing API | proven on one thermostat in `manual` mode (2026-10-31); **open in this version for the designated thermostat, in `manual` mode only** |
+| `{"current_heating_setpoint": 19.5}` | sharing API | proven on one thermostat in `manual` mode (2026-10-31); **open for the designated thermostats, in `manual` mode only** |
+| `{"preset": "manual" \| "program"}` | sharing API | proven on one thermostat (2026-10-31); **open for the designated thermostats** |
+| `{"preset": "eco" \| "holiday"}` | sharing API | written once (2026-10-31); closed: the setpoint the device then follows cannot be written |
 | `{"system_mode": "heat" \| "off"}` | sharing API | proven on one thermostat (2026-10-31); closed in this version |
-| `{"preset": "program" \| "manual" \| "eco" \| "holiday"}` | sharing API | proven on one thermostat (2026-10-31); closed in this version |
 | `{"child_lock": …}`, `{"window_detection": …}`, `{"local_temperature_calibration": …}`, `{"holiday_temperature": …}` | sharing API | candidates, closed: declared by the device, never written |
 | `{"preset": "antifrost"}`, `{"eco_temperature": …}`, `{"antifrost_temperature": …}` | none | no route |
 
@@ -293,3 +316,4 @@ families (`occupied_heating_setpoint` there, `current_heating_setpoint` here), a
 | 2 | 2026-11-27 | 0.1.1 | Names fixed after M0 on the Zigbee2MQTT vocabulary of the closest pilot-wire thermostat. Changed: `preset` value `schedule` → `program` (and the future `frost_protection` → `antifrost`); `frost_protection_temperature` → `antifrost_temperature`; `definition.model` `FP Thermostat` → `TS0601_fu1bfwza`. Added: `ieee_address` in the descriptor. Announced, not published yet: `temperature_sensibility`, `energy_today`, `energy_yesterday`, `power` from DP 11 |
 | 3 | 2026-11-27 | 0.2.0 | Sharing API channel (QR-code login) and first write. Added: `bridge/info.writes`; channel states `unauthenticated`, `login_required`, `waiting_for_scan`, `login_expired`, `unavailable`, and `last_ok`; `window_detection`, `child_lock`, `local_temperature_calibration` published; `preset: "antifrost"`; `fault` names `e1` / `e2` / `e3`; `product_id_source: "account"`; `/set` accepts `current_heating_setpoint` for one designated thermostat when `read_only` is `false`, with a response to every `/set` (`data.results`, 30 °C ceiling). Changed: each property comes from the channel proven for it when the sharing API is connected (the LAN alone otherwise); availability is "a reading younger than 10 minutes, and online for the account" (was: three passes without an answer); `bridge/info` is republished on change only and its channel entries lose `devices` / `devices_answering` and the state `unsupported`; unsupported devices are no longer listed; `tuya.gateway` can be absent; refusal texts. Still announced, not published: `temperature_sensibility`, `energy_today`, `energy_yesterday`, `power` from DP 11 |
 | 4 | 2026-11-27 | 0.2.2 | `current_heating_setpoint` is accepted only while the designated thermostat is in `manual` mode; in any other mode, or while the mode is unknown, the command is refused with nothing sent and the mode named in `error`. Added: the reason (§4, "Why `manual` only"): in `program` the running schedule slot overwrites a written setpoint |
+| 5 | 2026-11-27 | 0.3.0 | Added: `preset` is writable, `manual` and `program` only (`eco`, `holiday`, `antifrost` refused, nothing sent); several designated thermostats, `bridge/info.writes.devices`; `writes.keys` is `["current_heating_setpoint", "preset"]`; a rate limit per thermostat (one write every 10 s, 30 an hour), refused with the delay in `error`. Changed: one key per command (two keys are refused); `writes.device` is the first of `devices`, kept for readers of version 4; refusal texts ("designated thermostats only", "one key per command") |

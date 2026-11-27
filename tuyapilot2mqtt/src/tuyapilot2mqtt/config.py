@@ -43,10 +43,10 @@ class Settings:
     developer_access_id: str = field(default="", repr=False)
     developer_access_secret: str = field(default="", repr=False)
     developer_region: str = "eu"
-    # The single write of this version: the manual setpoint, on one designated thermostat
-    # (its friendly name or its Tuya device id). Closed by default.
+    # The writes of this version (the manual setpoint, and the preset manual or program), on the
+    # designated thermostats only: friendly names or Tuya device ids. Closed by default.
     writes_enabled: bool = False
-    write_device: str = ""
+    write_devices: tuple[str, ...] = ()
 
 
 _BOOL = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
@@ -57,6 +57,9 @@ def _coerce(name: str, kind: Any, raw: Any) -> Any:
         if name == "channels":
             items = raw.replace(",", " ").split() if isinstance(raw, str) else list(raw)
             return tuple(str(i) for i in items)
+        if name == "write_devices":  # names can hold spaces: a string is split on commas only
+            items = raw.split(",") if isinstance(raw, str) else list(raw)
+            return tuple(dict.fromkeys(str(i).strip() for i in items if str(i).strip()))
         if kind == "bool":
             return raw if isinstance(raw, bool) else _BOOL[str(raw).strip().lower()]
         if kind == "int":

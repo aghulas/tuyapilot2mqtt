@@ -89,7 +89,7 @@ def dry_run(settings: Settings) -> int:
     printer = _Printer()
     for writes in (False, True):
         made_up = dataclasses.replace(
-            settings, channels=("lan", "sharing"), writes_enabled=writes, write_device="Thermostat 1"
+            settings, channels=("lan", "sharing"), writes_enabled=writes, write_devices=("Thermostat 1",)
         )
         bridge = Bridge(
             printer,
@@ -242,7 +242,11 @@ def run(settings: Settings) -> int:
         CONTRACT_VERSION,
         ",".join(settings.channels) or "none",
         settings.poll_interval,
-        "enabled in the options (one key, one thermostat)" if settings.writes_enabled else "disabled",
+        (
+            f"enabled in the options ({len(settings.write_devices)} thermostat(s) designated)"
+            if settings.writes_enabled
+            else "disabled"
+        ),
     )
     page = _login_page() if "sharing" in settings.channels else None
     client.connect_async(settings.mqtt_host, settings.mqtt_port, keepalive=60)

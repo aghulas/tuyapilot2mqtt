@@ -102,7 +102,11 @@ class Sharing:
     def send(self, dev_id: str, commands: list[dict[str, Any]]) -> None:
         self.sent.append((dev_id, commands))
         if not self.deaf:
-            self.status[dev_id]["setpoint"] = commands[0]["value"] / 10
+            command = commands[0]
+            if command["code"] == "mode":
+                self.status[dev_id]["mode"] = command["value"]
+            else:
+                self.status[dev_id]["setpoint"] = command["value"] / 10
 
 
 LAN_FULL = {
@@ -191,10 +195,10 @@ def test_lan_alone_publishes_every_property_it_read() -> None:
 
     assert transport.last("Room A/availability") == {"state": "online"}
     info = transport.last("bridge/info")
-    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 4
+    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 5
     assert info["read_only"] is True
     assert info["writes"] == {
-        "enabled": False, "keys": ["current_heating_setpoint"], "device": None,
+        "enabled": False, "keys": ["current_heating_setpoint", "preset"], "devices": [], "device": None,
         "closed": "writes are disabled in the options",
     }  # fmt: skip
     assert info["channels"]["lan"]["state"] == "online"
@@ -281,7 +285,7 @@ def test_channel_enabled_but_not_buildable_is_unavailable() -> None:
 
 # --- the single write ---------------------------------------------------------------------------
 
-OPEN = {"sharing": "account", "writes_enabled": True, "write_device": "Room A"}
+OPEN = {"sharing": "account", "writes_enabled": True, "write_devices": ("Room A",)}
 
 
 def test_closed_by_default_every_set_is_refused_and_nothing_is_sent() -> None:
@@ -304,8 +308,8 @@ def test_closed_by_default_every_set_is_refused_and_nothing_is_sent() -> None:
     ("options", "reason"),
     [
         ({"writes_enabled": True}, "no thermostat is designated in the options"),
-        ({"writes_enabled": True, "write_device": "Room Z"}, "the designated thermostat is not among the devices"),
-        ({"write_device": "Room A"}, "writes are disabled in the options"),
+        ({"writes_enabled": True, "write_devices": ("Room Z",)}, "none of the designated thermostats is among the devices"),  # noqa: E501
+        ({"write_devices": ("Room A",)}, "writes are disabled in the options"),
     ],
 )
 def test_read_only_until_everything_is_in_place(options: dict[str, Any], reason: str) -> None:
@@ -317,9 +321,9 @@ def test_read_only_until_everything_is_in_place(options: dict[str, Any], reason:
 
 
 def test_read_only_without_a_connected_sharing_channel() -> None:
-    bridge, transport, _, _ = make(writes_enabled=True, write_device="Room A")
+    bridge, transport, _, _ = make(writes_enabled=True, write_devices=("Room A",))
     assert transport.last("bridge/info")["writes"]["closed"] == "the sharing channel is not enabled"
-    bridge, transport, _, _ = make(sharing=session.NoSession(), writes_enabled=True, write_device="Room A")
+    bridge, transport, _, _ = make(sharing=session.NoSession(), writes_enabled=True, write_devices=("Room A",))
     info = transport.last("bridge/info")
     assert info["read_only"] is True and info["writes"]["closed"] == "the sharing channel is not connected"
 
@@ -328,7 +332,7 @@ def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() ->
     bridge, transport, clock, sharing = make(**OPEN)
     info = transport.last("bridge/info")
     assert info["read_only"] is False and info["writes"] == {
-        "enabled": True, "keys": ["current_heating_setpoint"], "device": "Room A",
+        "enabled": True, "keys": ["current_heating_setpoint", "preset"], "devices": ["Room A"], "device": "Room A",
     }  # fmt: skip
     clock.now += 5
     set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "abc"})
@@ -347,8 +351,8 @@ def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() ->
 
 
 def test_designation_by_device_id() -> None:
-    bridge, transport, clock, sharing = make(sharing="account", writes_enabled=True, write_device=B)
-    assert transport.last("bridge/info")["writes"]["device"] == "Room B 1"
+    bridge, transport, clock, sharing = make(sharing="account", writes_enabled=True, write_devices=(B,))
+    assert transport.last("bridge/info")["writes"]["devices"] == ["Room B 1"]
     set_(bridge, "Room B 1", {"current_heating_setpoint": 10})
     assert "'program' mode" in transport.last("bridge/response/device/set")["error"]  # trial 1, refused now
     assert sharing.sent == []
@@ -362,11 +366,17 @@ def test_designation_by_device_id() -> None:
 @pytest.mark.parametrize(
     ("name", "payload", "error"),
     [
-        ("Room B 1", {"current_heating_setpoint": 20.5}, "designated thermostat only"),
-        ("Room A", {"system_mode": "off"}, "only current_heating_setpoint"),
-        ("Room A", {"preset": "eco"}, "only current_heating_setpoint"),
-        ("Room A", {"current_heating_setpoint": 20.5, "system_mode": "off"}, "only current_heating_setpoint"),
-        ("Room A", {"transaction": "x"}, "only current_heating_setpoint"),
+        ("Room B 1", {"current_heating_setpoint": 20.5}, "designated thermostats only"),
+        ("Room B 1", {"preset": "program"}, "designated thermostats only"),
+        ("Room A", {"system_mode": "off"}, "current_heating_setpoint or preset only"),
+        ("Room A", {"preset": "manual", "current_heating_setpoint": 20.5}, "one key per command"),
+        ("Room A", {"current_heating_setpoint": 20.5, "system_mode": "off"}, "one key per command"),
+        ("Room A", {"transaction": "x"}, "one key per command"),
+        ("Room A", {"preset": "eco"}, "only 'manual' and 'program' can be written, not 'eco'"),
+        ("Room A", {"preset": "holiday"}, "not 'holiday'"),
+        ("Room A", {"preset": "antifrost"}, "not 'antifrost'"),
+        ("Room A", {"preset": "schedule"}, "not 'schedule'"),
+        ("Room A", {"preset": 3}, "not 3"),
         ("Room A", {"current_heating_setpoint": 20.3}, "not on the device's step"),
         ("Room A", {"current_heating_setpoint": 4.5}, "outside the device's bounds"),
         ("Room A", {"current_heating_setpoint": 30.5}, "above the ceiling"),
@@ -441,7 +451,7 @@ def test_the_raw_command_sent_is_logged_without_the_device_id(caplog: pytest.Log
     with caplog.at_level(logging.WARNING, logger="tuyapilot2mqtt"):
         set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
     assert sharing.sent == [(A, [{"code": "temp_set", "value": 205}])]
-    assert "WRITE sent to the designated thermostat, once: temp_set=205" in caplog.text
+    assert "WRITE sent to a designated thermostat, once: temp_set=205" in caplog.text
     assert A not in caplog.text
 
 
@@ -503,17 +513,95 @@ def test_every_request_is_refused() -> None:
 def test_the_gate_itself_refuses_what_the_bridge_filters() -> None:
     bridge, _, _, sharing = make(**OPEN)
     gate = bridge.gate
-    assert isinstance(gate, TrialGate) and gate.designated == A
+    assert isinstance(gate, TrialGate) and gate.designated == {A}
     a, b = bridge.devices[A], bridge.devices[B]
-    with pytest.raises(WriteRefused, match="only current_heating_setpoint"):
+    with pytest.raises(WriteRefused, match="only current_heating_setpoint or preset"):
         gate.plan(a, sharing.spec(A), "switch", False)
-    with pytest.raises(WriteRefused, match="designated thermostat only"):
+    with pytest.raises(WriteRefused, match="designated thermostats only"):
         gate.plan(b, sharing.spec(B), "setpoint", 20.0)
+    with pytest.raises(WriteRefused, match="only manual and program"):
+        gate.plan(a, sharing.spec(A), "mode", "eco")
     with pytest.raises(WriteRefused, match="weekly schedule"):
         gate.write_schedule(a, {"monday": []})
-    gate.designated = None
-    with pytest.raises(WriteRefused, match="designated thermostat only"):
+    gate.designated = frozenset()
+    with pytest.raises(WriteRefused, match="designated thermostats only"):
         gate.plan(a, sharing.spec(A), "setpoint", 20.0)
+
+
+def test_preset_manual_then_setpoint_then_program_on_two_thermostats() -> None:
+    bridge, transport, clock, sharing = make(sharing="account", writes_enabled=True, write_devices=("Room A", B))
+    info = transport.last("bridge/info")
+    assert info["read_only"] is False and info["writes"]["devices"] == ["Room A", "Room B 1"]
+    sequence = [
+        ({"preset": "manual"}, {"code": "mode", "value": "manual"}),
+        ({"current_heating_setpoint": 9.5}, {"code": "temp_set", "value": 95}),
+        ({"current_heating_setpoint": 9.0}, {"code": "temp_set", "value": 90}),
+        ({"preset": "program"}, {"code": "mode", "value": "program"}),
+    ]
+    for payload, raw in sequence:
+        clock.now += 11
+        set_(bridge, "Room B 1", payload | {"transaction": "s"})
+        response = transport.last("bridge/response/device/set")
+        assert response["status"] == "ok", response
+        [result] = response["data"]["results"]
+        assert result["confirmed"] is True and result["property"] == next(iter(payload))
+        assert sharing.sent[-1] == (B, [raw])
+    state = transport.last("Room B 1")
+    assert state["preset"] == "program" and state["tuya"]["mode"] == "program"
+    assert state["current_heating_setpoint"] == 9.0
+    assert len(sharing.sent) == 4
+
+
+def test_a_preset_the_device_did_not_take_is_not_published() -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    sharing.deaf = True
+    real_read = sharing.read
+
+    def read(ids: list[str]) -> list[Reading]:
+        clock.now += 5
+        return real_read(ids)
+
+    sharing.read = read
+    set_(bridge, "Room A", {"preset": "program"})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and "not confirmed" in response["error"]
+    assert transport.last("Room A")["preset"] == "manual" and len(sharing.sent) == 1
+
+
+def test_rate_limit_per_thermostat() -> None:
+    bridge, transport, clock, sharing = make(sharing="account", writes_enabled=True, write_devices=("Room A", B))
+    set_(bridge, "Room A", {"preset": "manual"})
+    clock.now += 5
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "r"})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and response["transaction"] == "r"
+    assert response["error"] == (
+        "rate limit: one write every 10 s and 30 an hour per thermostat; retry in 5 s; nothing was sent to the device"
+    )
+    set_(bridge, "Room B 1", {"preset": "manual"})  # another thermostat has its own count
+    assert transport.last("bridge/response/device/set")["status"] == "ok"
+    assert len(sharing.sent) == 2
+    for _ in range(29):
+        clock.now += 10
+        set_(bridge, "Room A", {"preset": "manual"})
+        assert transport.last("bridge/response/device/set")["status"] == "ok"
+    clock.now += 10
+    set_(bridge, "Room A", {"preset": "manual"})
+    assert "30 an hour" in transport.last("bridge/response/device/set")["error"]
+    assert len(sharing.sent) == 31
+
+
+def test_a_refusal_is_not_counted_by_the_rate_limit() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    set_(bridge, "Room A", {"current_heating_setpoint": 4.5})  # refused by the gate, nothing sent
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert transport.last("bridge/response/device/set")["status"] == "ok" and len(sharing.sent) == 1
+
+
+def test_write_devices_from_the_environment_split_on_commas() -> None:
+    settings = config.load(None, {"TUYAPILOT_WRITE_DEVICES": "F-0 Room 2, F-0 Room 1,,F-0 Room 2"})
+    assert settings.write_devices == ("F-0 Room 2", "F-0 Room 1")
+    assert config.load(None, {}).write_devices == ()
 
 
 # --- contract names -----------------------------------------------------------------------------
@@ -662,7 +750,7 @@ def test_no_session_refuses_every_call() -> None:
 
 def test_settings_defaults_are_read_only_and_hide_secrets(tmp_path: Any) -> None:
     defaults = config.Settings()
-    assert defaults.writes_enabled is False and defaults.write_device == "" and defaults.channels == ("lan",)
+    assert defaults.writes_enabled is False and defaults.write_devices == () and defaults.channels == ("lan",)
     options = tmp_path / "options.json"
     options.write_text(
         json.dumps({"poll_interval": 120, "channels": ["lan", "sharing"], "mqtt_password": "", "writes_enabled": True}),

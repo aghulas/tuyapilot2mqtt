@@ -1,5 +1,5 @@
 name: "tuyapilot2mqtt"
-version: "0.2.3"
+version: "0.3.0"
 slug: "tuyapilot2mqtt"
 description: "Tuya pilot-wire thermostats behind a Tuya gateway, published to Mosquitto in the Zigbee2MQTT dialect for the Tuya Pilot Wire Companion. Read only by default."
 url: "https://github.com/aghulas/tuyapilot2mqtt"
@@ -37,7 +37,7 @@ options:
   developer_access_secret: ""
   developer_region: "eu"
   writes_enabled: false
-  write_device: ""
+  write_devices: []
 schema:
   base_topic: str
   mqtt_host: str?
@@ -58,4 +58,5 @@ schema:
   developer_access_secret: password?
   developer_region: list(eu|us|cn|in|sg)?
   writes_enabled: bool
-  write_device: str?
+  write_devices:
+    - str

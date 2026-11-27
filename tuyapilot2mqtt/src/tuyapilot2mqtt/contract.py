@@ -1,8 +1,9 @@
 """The MQTT contract of this repository, over the library's dialect codec.
 
 ``docs/mqtt-contract.md`` is changed here first and the library codec follows: the codec of
-``pytuya-pilot-wire`` 0.2.0 still speaks draft 0 for a few names. This module is the difference,
-and nothing else: names, the descriptor's identity fields, timestamps. No Tuya logic.
+``pytuya-pilot-wire`` before 0.3.0 spoke draft 0 for a few names, still mapped here so that a
+reading never depends on the library's version. This module is the difference, and nothing else:
+names, the descriptor's identity fields, timestamps. No Tuya logic.
 """
 
 from __future__ import annotations
@@ -22,8 +23,11 @@ DESCRIPTION = "Pilot-wire thermostat"
 _PROPERTIES = {"frost_protection_temperature": "antifrost_temperature"}
 _PRESETS = {"schedule": "program", "frost_protection": "antifrost"}
 
-# The only `/set` key this version of the bridge can open.
-OPEN_SET_KEY = "current_heating_setpoint"
+# The `/set` keys this version of the bridge can open, one per command, and the presets it writes.
+SETPOINT_KEY = "current_heating_setpoint"
+PRESET_KEY = "preset"
+OPEN_SET_KEYS = (SETPOINT_KEY, PRESET_KEY)
+WRITABLE_PRESETS = ("manual", "program")
 
 _EUI64 = re.compile(r"[0-9a-fA-F]{16}")
 

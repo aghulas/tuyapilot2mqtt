@@ -7,11 +7,13 @@ repository says beyond the library's draft-0 codec, and the policy of this versi
 - ``bridge/info``, descriptors and state objects in the shape of ``docs/mqtt-contract.md``;
 - the thermostats of the local keys file when the sharing channel has no session yet, and the LAN
   readings standing in for the state while the sharing channel is not connected;
-- **one write only**: ``current_heating_setpoint``, on the one thermostat the owner designated,
-  when the owner enabled writes, the sharing channel is connected and the thermostat is in
-  ``manual`` mode. Everything else on ``/set`` and every ``bridge/request/*`` is refused before
-  the library sees it, and refused a second time by the gate (which reads the mode again just
-  before sending);
+- **two writes, one key per command**, on the thermostats the owner designated
+  (``write_devices``), when the owner enabled writes and the sharing channel is connected:
+  ``preset`` to ``manual`` or ``program``, and ``current_heating_setpoint`` while the thermostat
+  is in ``manual`` mode. Everything else on ``/set`` and every ``bridge/request/*`` is refused
+  before the library sees it, and refused a second time by the gate (which reads the device again
+  just before sending);
+- a rate limit per thermostat: one write every 10 s, 30 an hour, counted on what was sent;
 - the raw command actually sent to the device is logged (data-point code and raw value, no id).
 """
 
@@ -20,6 +22,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import logging
+from collections import deque
 from collections.abc import Callable, Mapping
 from typing import Any
 
@@ -42,45 +45,66 @@ REQUEST_ERROR = f"request not available in this version; {NOTHING_SENT}"
 
 # Library channel states -> contract states (§1.1).
 _STATES = {"idle": "starting", "ok": "online", "error": "offline", "unauthenticated": "unauthenticated"}
-_SETPOINT_KEY = "setpoint"  # the library's model key behind `current_heating_setpoint`
+# The library's model keys behind the open `/set` keys.
+_MODEL_KEYS = {"setpoint": contract.SETPOINT_KEY, "mode": contract.PRESET_KEY}
+
+# Rate limit per thermostat, on the commands actually sent.
+WRITE_MIN_INTERVAL = 10.0
+WRITE_HOURLY_MAX = 30
 
 
 class _LoggedSend:
     """The sharing writer, logging the raw command it sends: data-point code and raw value only."""
 
-    def __init__(self, writer: SharingWriter) -> None:
+    def __init__(self, writer: SharingWriter, on_send: Callable[[str], None]) -> None:
         self._writer = writer
+        self._on_send = on_send
 
     def read(self, dev_ids: list[str]) -> list[Reading]:
         return self._writer.read(dev_ids)
 
     def send(self, dev_id: str, commands: list[dict[str, Any]]) -> None:
         sent = ", ".join(f"{command.get('code')}={command.get('value')!r}" for command in commands)
-        log.warning("WRITE sent to the designated thermostat, once: %s", sent)
+        log.warning("WRITE sent to a designated thermostat, once: %s", sent)
+        self._on_send(dev_id)  # counted before the call: a send that fails may still have reached it
         self._writer.send(dev_id, commands)
 
 
 class TrialGate(WriteGate):
-    """The library's write gate, narrowed to the single write this version opens.
+    """The library's write gate, narrowed to the writes this version opens.
 
-    The manual setpoint of the designated thermostat passes on to the library's checks (route,
-    the device's own bounds and step, ceiling, fresh read, refusal in any mode but ``manual``, one
-    send, read-back). Any other key, any other device and the weekly schedule stop here.
+    The manual setpoint and the mode (``manual`` or ``program``) of a designated thermostat pass on
+    to the library's checks (route, the device's own bounds, step and modes, ceiling, fresh read,
+    setpoint refused in any mode but ``manual``, one send, read-back). Any other key, any other
+    device, any other mode and the weekly schedule stop here.
     """
 
-    designated: str | None = None  # Tuya device id of the designated thermostat, once known
+    designated: frozenset[str] = frozenset()  # Tuya device ids of the designated thermostats
 
-    def __init__(self, router: Any, *, sharing: SharingWriter | None = None, **options: Any) -> None:
-        super().__init__(router, sharing=None if sharing is None else _LoggedSend(sharing), **options)
+    def __init__(
+        self,
+        router: Any,
+        *,
+        sharing: SharingWriter | None = None,
+        on_send: Callable[[str], None] = lambda _dev_id: None,
+        **options: Any,
+    ) -> None:
+        self._on_send = on_send
+        super().__init__(router, sharing=self._logged(sharing), **options)
+
+    def _logged(self, sharing: SharingWriter | None) -> SharingWriter | None:
+        return None if sharing is None else _LoggedSend(sharing, self._on_send)
 
     def replace(self, *, sharing: SharingWriter | None = None, developer: Any = None) -> None:
-        super().replace(sharing=None if sharing is None else _LoggedSend(sharing), developer=developer)
+        super().replace(sharing=self._logged(sharing), developer=developer)
 
     def plan(self, device: Device, spec: DeviceSpec | None, key: str, value: Any) -> PlannedWrite:
-        if key != _SETPOINT_KEY:
-            raise WriteRefused(f"only {contract.OPEN_SET_KEY} can be written in this version")
-        if self.designated is None or device.dev_id != self.designated:
-            raise WriteRefused("writes are open for the designated thermostat only")
+        if key not in _MODEL_KEYS:
+            raise WriteRefused(f"only {' or '.join(contract.OPEN_SET_KEYS)} can be written in this version")
+        if device.dev_id not in self.designated:
+            raise WriteRefused("writes are open for the designated thermostats only")
+        if key == "mode" and value not in contract.WRITABLE_PRESETS:
+            raise WriteRefused(f"preset: only {' and '.join(contract.WRITABLE_PRESETS)} can be written")
         return super().plan(device, spec, key, value)
 
     def write_schedule(self, device: Device, days: Mapping[str, Any]) -> ScheduleResult:
@@ -112,8 +136,14 @@ class Bridge(LibraryBridge):
         extra = {} if clock is None else {"clock": clock}
         super().__init__(transport, sharing=sharing, lan=lan, developer=developer, config=config, **extra)
         self.settings = settings
+        self._sent_at: dict[str, deque[float]] = {}
         self.gate = TrialGate(
-            self.router, sharing=sharing, developer=None, enabled=settings.writes_enabled, **(gate_options or {})
+            self.router,
+            sharing=sharing,
+            developer=None,
+            enabled=settings.writes_enabled,
+            on_send=self._count_send,
+            **(gate_options or {}),
         )
         self._local = local
         # Channels enabled in the options that could not be built, with the reason (no secret in it).
@@ -129,29 +159,50 @@ class Bridge(LibraryBridge):
         status = self.status.get(Channel.SHARING)
         return status is not None and status.state == "ok"
 
-    def _designated(self) -> str | None:
-        """Tuya device id of the designated thermostat, when it is one of the known devices."""
-        wanted = self.settings.write_device.strip()
-        if not wanted:
-            return None
-        for dev_id, name in self.names.items():
-            if wanted in (dev_id, name):
-                return dev_id
-        return None
+    def _designated(self) -> list[str]:
+        """Tuya device ids of the designated thermostats that are among the known devices, in
+        the order of their friendly names."""
+        wanted = set(self.settings.write_devices)
+        found = [dev_id for dev_id, name in self.names.items() if dev_id in wanted or name in wanted]
+        return sorted(found, key=lambda dev_id: self.names[dev_id])
 
     def closed_reason(self) -> str | None:
-        """Why no write can pass now, or ``None`` when the single write of this version is open."""
+        """Why no write can pass now, or ``None`` when the writes of this version are open."""
         if not self.settings.writes_enabled:
             return "writes are disabled in the options"
-        if not self.settings.write_device.strip():
+        if not self.settings.write_devices:
             return "no thermostat is designated in the options"
         if Channel.SHARING not in self.status:
             return "the sharing channel is not enabled"
         if not self._sharing_connected():
             return "the sharing channel is not connected"
-        if self._designated() is None:
-            return "the designated thermostat is not among the devices"
+        if not self._designated():
+            return "none of the designated thermostats is among the devices"
         return None
+
+    # -- rate limit -------------------------------------------------------------------------
+
+    def _count_send(self, dev_id: str) -> None:
+        self._sent_at.setdefault(dev_id, deque()).append(self._clock())
+
+    def _rate_refusal(self, dev_id: str) -> str | None:
+        """Why a write to ``dev_id`` would exceed the rate limit now, or ``None``."""
+        now = self._clock()
+        sent = self._sent_at.get(dev_id)
+        if not sent:
+            return None
+        while sent and now - sent[0] >= 3600:
+            sent.popleft()
+        if sent and now - sent[-1] < WRITE_MIN_INTERVAL:
+            wait = WRITE_MIN_INTERVAL - (now - sent[-1])
+        elif len(sent) >= WRITE_HOURLY_MAX:
+            wait = 3600 - (now - sent[0])
+        else:
+            return None
+        return (
+            f"rate limit: one write every {WRITE_MIN_INTERVAL:g} s and {WRITE_HOURLY_MAX} an hour per"
+            f" thermostat; retry in {max(1, round(wait))} s"
+        )
 
     # -- bridge/info ------------------------------------------------------------------------
 
@@ -181,11 +232,13 @@ class Bridge(LibraryBridge):
         """Publish ``bridge/info`` (contract §1.1) when something other than a timestamp changed."""
         reason = self.closed_reason()
         designated = self._designated()
-        self.gate.designated = designated
+        self.gate.designated = frozenset(designated)
+        names = [self.names[dev_id] for dev_id in designated]
         writes: dict[str, Any] = {
             "enabled": self.settings.writes_enabled,
-            "keys": [contract.OPEN_SET_KEY],
-            "device": self.names.get(designated) if designated else None,
+            "keys": list(contract.OPEN_SET_KEYS),
+            "devices": names,
+            "device": names[0] if names else None,  # contract 4 and earlier; the first of `devices`
         }
         if reason:
             writes["closed"] = reason
@@ -206,7 +259,11 @@ class Bridge(LibraryBridge):
         if signature != self._info:
             if (reason is None) != self._open:
                 self._open = reason is None
-                log.warning("the write of %s is now %s", contract.OPEN_SET_KEY, "OPEN" if self._open else "closed")
+                log.warning(
+                    "the writes (%s) are now %s",
+                    ", ".join(contract.OPEN_SET_KEYS),
+                    f"OPEN on {len(names)} thermostat(s)" if self._open else "closed",
+                )
             self._info = signature
             self._publish(self._topic("bridge", "info"), info)
 
@@ -329,10 +386,17 @@ class Bridge(LibraryBridge):
         reason = self.closed_reason()
         if reason is not None:
             return f"read-only bridge: {reason}; {NOTHING_SENT}", keys, transaction
-        if keys != [contract.OPEN_SET_KEY]:
-            return f"only {contract.OPEN_SET_KEY} can be written in this version; {NOTHING_SENT}", keys, transaction
-        if dev_id != self._designated():
-            return f"writes are open for the designated thermostat only; {NOTHING_SENT}", keys, transaction
+        if len(keys) != 1 or keys[0] not in contract.OPEN_SET_KEYS:
+            allowed = " or ".join(contract.OPEN_SET_KEYS)
+            return f"one key per command, {allowed} only, in this version; {NOTHING_SENT}", keys, transaction
+        if dev_id not in self._designated():
+            return f"writes are open for the designated thermostats only; {NOTHING_SENT}", keys, transaction
+        if keys[0] == contract.PRESET_KEY:
+            value = payload[contract.PRESET_KEY]
+            if value not in contract.WRITABLE_PRESETS:
+                allowed = " and ".join(repr(p) for p in contract.WRITABLE_PRESETS)
+                return f"preset: only {allowed} can be written, not {value!r}; {NOTHING_SENT}", keys, transaction
+            return self._rate_check(dev_id, keys, transaction)
         held = self.states.get(dev_id)
         mode = held.values.get("mode") if held is not None else None
         mode_value = getattr(mode, "value", None)
@@ -340,8 +404,12 @@ class Bridge(LibraryBridge):
             return f"the mode of the thermostat is not known yet; {NOTHING_SENT}", keys, transaction
         if mode_value != dps.MODE_MANUAL:
             why = setpoint_mode_refusal(mode_value).removeprefix("setpoint: ")
-            return f"{contract.OPEN_SET_KEY}: {why}; {NOTHING_SENT}", keys, transaction
-        return None
+            return f"{contract.SETPOINT_KEY}: {why}; {NOTHING_SENT}", keys, transaction
+        return self._rate_check(dev_id, keys, transaction)
+
+    def _rate_check(self, dev_id: str, keys: list[str], transaction: Any) -> tuple[str, list[str], Any] | None:
+        limited = self._rate_refusal(dev_id)
+        return None if limited is None else (f"{limited}; {NOTHING_SENT}", keys, transaction)
 
     def handle_set(self, name: str, raw: str) -> None:
         refusal = self._refusal(name, raw)
@@ -350,15 +418,16 @@ class Bridge(LibraryBridge):
             log.info("command refused: %s", error.split(";")[0])
             self._respond("device/set", data={"device": name, "keys": keys}, error=error, transaction=transaction)
             return
-        self.gate.designated = self._designated()
-        log.warning("WRITE: %s asked for the designated thermostat", contract.OPEN_SET_KEY)
+        self.gate.designated = frozenset(self._designated())
+        key = next(k for k in json.loads(raw) if k != "transaction")
+        log.warning("WRITE: %s asked for a designated thermostat", key)
         try:
             super().handle_set(name, raw)
         except Exception as err:  # the answer must come, whatever broke
             log.error("write failed unexpectedly (%s)", type(err).__name__)
             self._respond(
                 "device/set",
-                data={"device": name, "keys": [contract.OPEN_SET_KEY]},
+                data={"device": name, "keys": [key]},
                 error=f"internal error ({type(err).__name__}); read the device before trusting its state",
                 transaction=json.loads(raw).get("transaction"),
             )
