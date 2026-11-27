@@ -5,7 +5,7 @@ publishes the topics of ``docs/mqtt-contract.md``. Read only unless the owner op
 write of this version (the manual setpoint of one designated thermostat) in the options.
 """
 
-__version__ = "0.2.2"
+__version__ = "0.2.3"
 
 # Version of docs/mqtt-contract.md this code publishes (``bridge/info.contract``).
 CONTRACT_VERSION = 4

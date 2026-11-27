@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.3
+
+MQTT contract version 4, unchanged. Built on `pytuya-pilot-wire` 0.2.2, pinned by tag.
+
+- **A session taken over by another client asks for a new login.** When another client logs in
+  to the Smart Life account with the same application (Home Assistant's `tuya` integration, for
+  instance), the bridge's session is answered `sign invalid` on every request. 0.2.2 retried it
+  forever as a passing error (`offline`); the sharing channel is now `unauthenticated`, and the QR
+  code to scan appears on the add-on's page. Keep a single client on the account.
+
 ## 0.2.2
 
 MQTT contract version 4. Built on `pytuya-pilot-wire` 0.2.1, pinned by tag.

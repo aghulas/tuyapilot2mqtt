@@ -1,6 +1,6 @@
 # MQTT contract
 
-Contract version: **4** (2026-11-27). Published by `tuyapilot2mqtt` 0.2.2: sharing API and LAN
+Contract version: **4** (2026-11-27). Published by `tuyapilot2mqtt` 0.2.2 and later: sharing API and LAN
 channels, **read only unless the owner opens the single write of this version** (§4). The same
 number is in `bridge/info.contract`; it is incremented at every change of this document that a
 reader of the topics can observe. History: [§7](#7-versions).
@@ -39,9 +39,9 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
 
 ```json
 {
-  "version": "0.2.2",
+  "version": "0.2.3",
   "contract": 4,
-  "library": {"name": "pytuya-pilot-wire", "version": "0.2.1"},
+  "library": {"name": "pytuya-pilot-wire", "version": "0.2.2"},
   "read_only": true,
   "writes": {"enabled": false, "keys": ["current_heating_setpoint"], "device": null,
              "closed": "writes are disabled in the options"},

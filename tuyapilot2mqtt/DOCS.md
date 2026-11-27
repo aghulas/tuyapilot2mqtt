@@ -61,7 +61,11 @@ from the published state, never guessed.
 
 Until you scan, the add-on keeps reading through the gateway and `bridge/info` says
 `"sharing": {"state": "waiting_for_scan"}` (or `login_required` while the user code is empty).
-The session is the add-on's own: it does not disturb the `tuya` integration or another client.
+**One client per account.** Home Assistant's `tuya` integration and other Smart Life tools log
+in with the same application as this add-on: when one of them logs in, the others' sessions stop
+working (`sign invalid`), and logging this add-on in breaks theirs. Disable the `tuya` integration
+for these thermostats before scanning. If another client takes the session over, the sharing
+channel turns `unauthenticated` and a new QR code appears on the page.
 The QR code is a short-lived login token: it is never written in the log, and the page answers
 Home Assistant's ingress only; do not share a screenshot of it.
 
