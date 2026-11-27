@@ -23,7 +23,7 @@ services:
       TUYAPILOT_DEVELOPER_ACCESS_SECRET: "${TUYAPILOT_DEVELOPER_ACCESS_SECRET:-}"
       TUYAPILOT_DEVELOPER_REGION: "${TUYAPILOT_DEVELOPER_REGION:-eu}"
       TUYAPILOT_WRITES_ENABLED: "${TUYAPILOT_WRITES_ENABLED:-false}"
-      TUYAPILOT_WRITE_DEVICE: "${TUYAPILOT_WRITE_DEVICE:-}"
+      TUYAPILOT_WRITE_DEVICES: "${TUYAPILOT_WRITE_DEVICES:-}"
     volumes:
       # The Smart Life session of the sharing channel (a secret), kept across restarts.
       - "tuyapilot2mqtt-data:/data"
