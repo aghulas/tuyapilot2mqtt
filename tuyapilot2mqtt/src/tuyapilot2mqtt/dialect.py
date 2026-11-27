@@ -11,9 +11,11 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-# Raw mode (DP 2) → preset. Only values whose meaning is established. Any other value gives no
-# ``preset``; the raw value stays readable in ``tuya.mode``.
-PRESETS = {"program": "schedule", "manual": "manual", "eco": "eco", "holiday": "holiday"}
+# Raw mode (DP 2) → preset, in the vocabulary Zigbee2MQTT uses for the closest pilot-wire
+# thermostat. Only values whose meaning is established. Any other value gives no ``preset``; the
+# raw value stays readable in ``tuya.mode``. ``antifrost`` joins the table once the raw value the
+# devices report for it is recorded in the library.
+PRESETS = {"program": "program", "manual": "manual", "eco": "eco", "holiday": "holiday"}
 
 WINDOW = {"open": True, "close": False}
 
@@ -23,7 +25,7 @@ _COPIED = {
     "current_heating_setpoint": "setpoint",
     "holiday_temperature": "holiday_setpoint",
     "eco_temperature": "eco_setpoint",
-    "frost_protection_temperature": "frost_setpoint",
+    "antifrost_temperature": "frost_setpoint",
     "energy": "energy",
 }
 

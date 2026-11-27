@@ -24,12 +24,12 @@ def _synthetic() -> tuple[Gateway, list[Thermostat], Any]:
     """A made-up gateway with two thermostats, for ``--dry-run``. No real id, no network."""
     gateway = Gateway("gateway0", "0" * 16)
     thermostats = [
-        Thermostat(f"thermostat000000000000{n}", f"node{n}", f"Thermostat {n}", "fu1bfwza", "config", "wk", "gateway0")
+        Thermostat(f"device{n}", f"a4c13800000000{n:02x}", f"Thermostat {n}", "fu1bfwza", "config", "wk", "gateway0")
         for n in (1, 2)
     ]
     readings = {
-        "node1": {"1": True, "2": "manual", "16": 195, "17": "close", "20": 0, "50": 200, "107": 1234, "124": "closed"},
-        "node2": {"1": True, "2": "program", "16": 182, "101": 2305, "102": 4300, "124": "opened"},
+        "a4c1380000000001": {"1": True, "2": "manual", "16": 195, "17": "close", "20": 0, "50": 200, "107": 1234},
+        "a4c1380000000002": {"1": True, "2": "program", "16": 182, "101": 2305, "102": 4300, "124": "opened"},
     }
     return gateway, thermostats, lambda _gateway, _thermostats: readings
 

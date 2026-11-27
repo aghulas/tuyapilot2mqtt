@@ -8,6 +8,7 @@ the machine; nothing here logs a key or an id.
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,9 @@ from typing import Any
 from pytuya_pilot_wire import dps
 
 THERMOSTAT_CATEGORY = "wk"
+# Zigbee model id and product: the name the device would have in a Zigbee2MQTT definition.
+MODEL = "TS0601_fu1bfwza"
+_EUI64 = re.compile(r"[0-9a-fA-F]{16}")
 
 
 class DevicesError(ValueError):
@@ -41,15 +45,21 @@ class Thermostat:
     def supported(self) -> bool:
         return self.product_id in dps.PRODUCTS
 
+    @property
+    def ieee_address(self) -> str | None:
+        """The Zigbee address, when the gateway's node id is one (EUI-64, 16 hexadecimal digits)."""
+        return f"0x{self.node_id.lower()}" if _EUI64.fullmatch(self.node_id) else None
+
     def descriptor(self) -> dict[str, Any]:
         """Entry of ``bridge/devices`` (contract §2)."""
-        return {
+        address = self.ieee_address
+        return ({"ieee_address": address} if address else {}) | {
             "friendly_name": self.friendly_name,
             "type": "EndDevice",
             "supported": self.supported,
             "definition": {
                 "vendor": "Tuya",
-                "model": "FP Thermostat",
+                "model": MODEL,
                 "description": "Pilot-wire thermostat",
             }
             if self.supported
