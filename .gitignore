@@ -18,3 +18,4 @@ session*.json
 *keys*.json
 captures/
 scratch/
+keys/
