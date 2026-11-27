@@ -76,12 +76,15 @@ Closed by default. To open it:
 `bridge/info` then says `"read_only": false`, and the bridge accepts
 `{"current_heating_setpoint": <value>}` on `tuyapilot2mqtt/<that thermostat>/set`, nothing else,
 on no other thermostat. The value must be within the device's own bounds (5 to 40 °C by 0.5) and
-not above 30 °C; the write is refused when the thermostat is offline or in frost protection. The
-command is sent once, the thermostat is read back, and the answer on
+not above 30 °C; the write is refused when the thermostat is offline or in any mode but `manual`
+(`program`, `eco`, `holiday`, frost protection). In `program` mode the thermostat replaces a
+written setpoint with the one of the running schedule slot, so put the thermostat in `manual` in
+the Smart Life app first, and back afterwards. The command is sent once, the thermostat is read back, and the answer on
 `tuyapilot2mqtt/bridge/response/device/set` says `ok` only when the thermostat reports the value.
 The published state changes from that read-back, never from the request.
 
-Set `writes_enabled` back to `false` to close it. Each write and each refusal is in the log.
+Set `writes_enabled` back to `false` to close it. Each write and each refusal is in the log,
+with the raw command sent (data-point code and raw value, never an id or a key).
 
 ## Options
 

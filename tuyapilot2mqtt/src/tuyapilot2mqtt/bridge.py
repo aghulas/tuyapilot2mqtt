@@ -8,9 +8,11 @@ repository says beyond the library's draft-0 codec, and the policy of this versi
 - the thermostats of the local keys file when the sharing channel has no session yet, and the LAN
   readings standing in for the state while the sharing channel is not connected;
 - **one write only**: ``current_heating_setpoint``, on the one thermostat the owner designated,
-  when the owner enabled writes and the sharing channel is connected. Everything else on
-  ``/set`` and every ``bridge/request/*`` is refused before the library sees it, and refused a
-  second time by the gate.
+  when the owner enabled writes, the sharing channel is connected and the thermostat is in
+  ``manual`` mode. Everything else on ``/set`` and every ``bridge/request/*`` is refused before
+  the library sees it, and refused a second time by the gate (which reads the mode again just
+  before sending);
+- the raw command actually sent to the device is logged (data-point code and raw value, no id).
 """
 
 from __future__ import annotations
@@ -22,11 +24,11 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from pytuya_pilot_wire import __version__ as library_version
-from pytuya_pilot_wire import dialect
+from pytuya_pilot_wire import dialect, dps
 from pytuya_pilot_wire.bridge import Bridge as LibraryBridge
 from pytuya_pilot_wire.bridge import BridgeConfig
 from pytuya_pilot_wire.errors import WriteRefused
-from pytuya_pilot_wire.gate import PlannedWrite, ScheduleResult, WriteGate
+from pytuya_pilot_wire.gate import PlannedWrite, ScheduleResult, SharingWriter, WriteGate, setpoint_mode_refusal
 from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, DeviceState, Reading
 
 from . import CONTRACT_VERSION, __version__, contract
@@ -43,15 +45,36 @@ _STATES = {"idle": "starting", "ok": "online", "error": "offline", "unauthentica
 _SETPOINT_KEY = "setpoint"  # the library's model key behind `current_heating_setpoint`
 
 
+class _LoggedSend:
+    """The sharing writer, logging the raw command it sends: data-point code and raw value only."""
+
+    def __init__(self, writer: SharingWriter) -> None:
+        self._writer = writer
+
+    def read(self, dev_ids: list[str]) -> list[Reading]:
+        return self._writer.read(dev_ids)
+
+    def send(self, dev_id: str, commands: list[dict[str, Any]]) -> None:
+        sent = ", ".join(f"{command.get('code')}={command.get('value')!r}" for command in commands)
+        log.warning("WRITE sent to the designated thermostat, once: %s", sent)
+        self._writer.send(dev_id, commands)
+
+
 class TrialGate(WriteGate):
     """The library's write gate, narrowed to the single write this version opens.
 
     The manual setpoint of the designated thermostat passes on to the library's checks (route,
-    the device's own bounds and step, ceiling, fresh read, frost-protection refusal, one send,
-    read-back). Any other key, any other device and the weekly schedule stop here.
+    the device's own bounds and step, ceiling, fresh read, refusal in any mode but ``manual``, one
+    send, read-back). Any other key, any other device and the weekly schedule stop here.
     """
 
     designated: str | None = None  # Tuya device id of the designated thermostat, once known
+
+    def __init__(self, router: Any, *, sharing: SharingWriter | None = None, **options: Any) -> None:
+        super().__init__(router, sharing=None if sharing is None else _LoggedSend(sharing), **options)
+
+    def replace(self, *, sharing: SharingWriter | None = None, developer: Any = None) -> None:
+        super().replace(sharing=None if sharing is None else _LoggedSend(sharing), developer=developer)
 
     def plan(self, device: Device, spec: DeviceSpec | None, key: str, value: Any) -> PlannedWrite:
         if key != _SETPOINT_KEY:
@@ -310,6 +333,14 @@ class Bridge(LibraryBridge):
             return f"only {contract.OPEN_SET_KEY} can be written in this version; {NOTHING_SENT}", keys, transaction
         if dev_id != self._designated():
             return f"writes are open for the designated thermostat only; {NOTHING_SENT}", keys, transaction
+        held = self.states.get(dev_id)
+        mode = held.values.get("mode") if held is not None else None
+        mode_value = getattr(mode, "value", None)
+        if mode_value is None:
+            return f"the mode of the thermostat is not known yet; {NOTHING_SENT}", keys, transaction
+        if mode_value != dps.MODE_MANUAL:
+            why = setpoint_mode_refusal(mode_value).removeprefix("setpoint: ")
+            return f"{contract.OPEN_SET_KEY}: {why}; {NOTHING_SENT}", keys, transaction
         return None
 
     def handle_set(self, name: str, raw: str) -> None:

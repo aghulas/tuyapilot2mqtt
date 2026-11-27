@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import stat
 from typing import Any
 
@@ -190,7 +191,7 @@ def test_lan_alone_publishes_every_property_it_read() -> None:
 
     assert transport.last("Room A/availability") == {"state": "online"}
     info = transport.last("bridge/info")
-    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 3
+    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 4
     assert info["read_only"] is True
     assert info["writes"] == {
         "enabled": False, "keys": ["current_heating_setpoint"], "device": None,
@@ -346,8 +347,14 @@ def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() ->
 
 
 def test_designation_by_device_id() -> None:
-    bridge, transport, _, sharing = make(sharing="account", writes_enabled=True, write_device=B)
+    bridge, transport, clock, sharing = make(sharing="account", writes_enabled=True, write_device=B)
     assert transport.last("bridge/info")["writes"]["device"] == "Room B 1"
+    set_(bridge, "Room B 1", {"current_heating_setpoint": 10})
+    assert "'program' mode" in transport.last("bridge/response/device/set")["error"]  # trial 1, refused now
+    assert sharing.sent == []
+    sharing.status[B]["mode"] = "manual"
+    clock.now += 60
+    bridge.poll()
     set_(bridge, "Room B 1", {"current_heating_setpoint": 10})
     assert sharing.sent == [(B, [{"code": "temp_set", "value": 100}])]
 
@@ -380,12 +387,62 @@ def test_refused_in_frost_protection_and_when_offline() -> None:
     bridge, transport, _, sharing = make(**OPEN)
     sharing.status[A]["mode"] = "hors"
     set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
-    assert "frost-protection mode" in transport.last("bridge/response/device/set")["error"]
+    assert "'hors' mode" in transport.last("bridge/response/device/set")["error"]
     sharing.status[A]["mode"] = "manual"
     sharing.read = lambda ids: [Reading(d, Channel.SHARING, 0.0, dict(sharing.status[d]), online=False) for d in ids]
     set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
     assert "offline" in transport.last("bridge/response/device/set")["error"]
     assert sharing.sent == []
+
+
+@pytest.mark.parametrize("mode", ["program", "eco", "holiday", "hors"])
+def test_refused_by_the_bridge_in_any_mode_but_manual(mode: str) -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    sharing.status[A]["mode"] = mode
+    clock.now += 60
+    bridge.poll()  # the bridge now holds the mode read from the account
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "m"})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and response["transaction"] == "m"
+    assert f"'{mode}' mode" in response["error"] and "only in 'manual' mode" in response["error"]
+    assert response["error"].endswith("nothing was sent to the device")
+    assert response["data"] == {"device": "Room A", "keys": ["current_heating_setpoint"]}
+    assert sharing.sent == []
+
+
+def test_program_mode_says_why() -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    sharing.status[A]["mode"] = "program"
+    clock.now += 60
+    bridge.poll()
+    set_(bridge, "Room A", {"current_heating_setpoint": 9.5})
+    assert "the running schedule slot overwrites" in transport.last("bridge/response/device/set")["error"]
+
+
+def test_refused_by_the_gate_when_the_mode_changed_since_the_last_read() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    sharing.status[A]["mode"] = "program"  # not polled yet: the bridge still holds "manual"
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and "'program' mode" in response["error"]
+    assert sharing.sent == []
+
+
+def test_refused_while_the_mode_is_unknown() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    bridge.states[A].values.pop("mode")
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert "mode of the thermostat is not known yet" in transport.last("bridge/response/device/set")["error"]
+    assert sharing.sent == []
+
+
+def test_the_raw_command_sent_is_logged_without_the_device_id(caplog: pytest.LogCaptureFixture) -> None:
+    bridge, _, _, sharing = make(**OPEN)
+    with caplog.at_level(logging.WARNING, logger="tuyapilot2mqtt"):
+        set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert sharing.sent == [(A, [{"code": "temp_set", "value": 205}])]
+    assert "WRITE sent to the designated thermostat, once: temp_set=205" in caplog.text
+    assert A not in caplog.text
 
 
 def test_a_write_the_device_did_not_take_is_an_error_and_the_state_is_what_was_read() -> None:

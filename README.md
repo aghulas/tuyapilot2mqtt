@@ -15,11 +15,11 @@ Unofficial: not affiliated with Tuya.
 
 ## Status
 
-**0.2.0 — read only by default, one write under trial.** The bridge reads the thermostats
+**0.2.2 — read only by default, one write under trial.** The bridge reads the thermostats
 through the Smart Life sharing API (QR-code login from the add-on's log) and through their gateway
-on the LAN, and publishes them: [MQTT contract](docs/mqtt-contract.md), version 3. It sends
+on the LAN, and publishes them: [MQTT contract](docs/mqtt-contract.md), version 4. It sends
 nothing to a device unless the owner opens the single write of this version: the manual setpoint
-of one designated thermostat, validated, sent once and read back. Every other command is refused.
+of one designated thermostat in `manual` mode, validated, sent once and read back. Every other command is refused.
 The other writes and the weekly schedule come with the next steps of the
 [roadmap](https://github.com/aghulas/ha-tuya-pilot-wire/blob/main/docs/roadmap.md).
 
@@ -63,7 +63,7 @@ policy of the version (`bridge.py`).
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ git+https://github.com/aghulas/pytuya-pilot-wire@v0.2.0" -e "./tuyapilot2mqtt[dev]"
+python3 -m venv .venv && .venv/bin/pip install "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ git+https://github.com/aghulas/pytuya-pilot-wire@v0.2.1" -e "./tuyapilot2mqtt[dev]"
 ```
 
 ```bash
