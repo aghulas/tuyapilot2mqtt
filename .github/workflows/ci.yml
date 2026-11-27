@@ -16,11 +16,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Install (library at the ref pinned in the Dockerfile)
+      - name: Install (library at the tag pinned in the Dockerfile)
         run: |
           ref="$(sed -n 's/^ARG PYTUYA_PILOT_WIRE_REF="\(.*\)"$/\1/p' tuyapilot2mqtt/Dockerfile)"
           test -n "$ref"
-          pip install "pytuya-pilot-wire @ https://github.com/aghulas/pytuya-pilot-wire/archive/${ref}.tar.gz"
+          pip install "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ https://github.com/aghulas/pytuya-pilot-wire/archive/refs/tags/${ref}.tar.gz"
           pip install -e "./tuyapilot2mqtt[dev]"
 
       - name: Lint

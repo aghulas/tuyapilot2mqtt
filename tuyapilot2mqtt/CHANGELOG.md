@@ -1,5 +1,28 @@
 # Changelog
 
+## 0.2.0
+
+MQTT contract version 3. Built on `pytuya-pilot-wire` 0.2.0 (channels, router, write gate, daemon
+core), pinned by tag.
+
+- **Sharing API channel** (Smart Life account): add `sharing` to `channels` and fill
+  `sharing_user_code`; the QR code to scan is printed in the log. Until the scan, the add-on keeps
+  reading through the gateway as before.
+- With the account connected: `window_detection`, `child_lock`, `local_temperature_calibration`
+  are published, faults are named `e1` / `e2` / `e3`, and on/off, mode and setpoint no longer
+  depend on what the gateway returns on a given read. `preset` is `antifrost` in frost protection.
+- **One write, closed by default**: `current_heating_setpoint` on the one thermostat designated in
+  `write_device`, when `writes_enabled` is true and the account is connected. Checked against the
+  device's bounds and step and a 30 °C ceiling, refused in frost protection, sent once, read back;
+  answered on `bridge/response/device/set`. Everything else is refused. `bridge/info.read_only`
+  is `false` only while that write can really pass.
+- Developer channel: accepted with its credentials (reads the eco and frost setpoints); reported
+  `unavailable` without them.
+- Availability: a thermostat is `offline` after ten minutes without a reading, or when the account
+  says so (was: three reads without an answer).
+- Not published yet: `temperature_sensibility`, `power` from DP 11, `energy_today`,
+  `energy_yesterday` (not read by the library).
+
 ## 0.1.1
 
 MQTT contract version 2: the property names are fixed on the Zigbee2MQTT vocabulary, now that the

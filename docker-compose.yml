@@ -17,6 +17,18 @@ services:
       TUYAPILOT_LAN_HOST: "${TUYAPILOT_LAN_HOST}"
       TUYAPILOT_LAN_KEYS_FILE: "/keys/devices.json"
       TUYAPILOT_LAN_VERSION: "${TUYAPILOT_LAN_VERSION:-3.3}"
+      TUYAPILOT_SHARING_USER_CODE: "${TUYAPILOT_SHARING_USER_CODE:-}"
+      TUYAPILOT_SHARING_SESSION_FILE: "/data/sharing_session.json"
+      TUYAPILOT_DEVELOPER_ACCESS_ID: "${TUYAPILOT_DEVELOPER_ACCESS_ID:-}"
+      TUYAPILOT_DEVELOPER_ACCESS_SECRET: "${TUYAPILOT_DEVELOPER_ACCESS_SECRET:-}"
+      TUYAPILOT_DEVELOPER_REGION: "${TUYAPILOT_DEVELOPER_REGION:-eu}"
+      TUYAPILOT_WRITES_ENABLED: "${TUYAPILOT_WRITES_ENABLED:-false}"
+      TUYAPILOT_WRITE_DEVICE: "${TUYAPILOT_WRITE_DEVICE:-}"
     volumes:
+      # The Smart Life session of the sharing channel (a secret), kept across restarts.
+      - "tuyapilot2mqtt-data:/data"
       # The keys file (a secret) stays outside the repository.
       - "${TUYAPILOT_KEYS_DIR:-./keys}:/keys:ro"
+
+volumes:
+  tuyapilot2mqtt-data:

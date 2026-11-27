@@ -3,22 +3,25 @@
 from __future__ import annotations
 
 import json
+import stat
+from typing import Any
 
 import pytest
+from pytuya_pilot_wire.errors import ChannelError, WriteRefused
+from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, Reading
 
-from tuyapilot2mqtt import CONTRACT_VERSION, cli, config, devices, dialect
-from tuyapilot2mqtt.bridge import MISSES_BEFORE_OFFLINE, Bridge
-from tuyapilot2mqtt.lan import LanChannel
+from tuyapilot2mqtt import CONTRACT_VERSION, cli, config, contract, devices, session
+from tuyapilot2mqtt.bridge import Bridge, TrialGate
 
 ENTRIES = [
-    {"id": "gw", "key": "k" * 16, "name": "Gateway", "category": "wg2", "sub": False},
-    {"id": "b", "key": "", "name": "Room/B #1", "category": "wk", "sub": True, "node_id": "A4C1380000000ABC"},
-    {"id": "a", "key": "", "name": "Room A", "category": "wk", "sub": True, "node_id": "na", "product_id": "fu1bfwza"},
-    {"id": "x", "key": "", "name": "Plug", "category": "cz", "sub": True, "node_id": "nx"},
+    {"id": "gateway1", "key": "k" * 16, "name": "Gateway", "category": "wg2", "sub": False},
+    {"id": "deviceb", "name": "Room/B #1", "category": "wk", "sub": True, "node_id": "A4C1380000000ABC"},
+    {"id": "devicea", "name": "Room A", "category": "wk", "sub": True, "node_id": "na", "product_id": "fu1bfwza"},
+    {"id": "devicex", "name": "Plug", "category": "cz", "sub": True, "node_id": "nx"},
+    {"id": "devicey", "name": "Other", "category": "wk", "sub": True, "node_id": "ny", "product_id": "unknown0"},
 ]
-
-
-NODES = {"nb": "A4C1380000000ABC"}
+LOCAL = devices.parse(ENTRIES, "fu1bfwza")
+A, B = "devicea", "deviceb"
 
 
 class Clock:
@@ -28,187 +31,558 @@ class Clock:
         return self.now
 
 
-def make(readings: dict, channels: tuple[str, ...] = ("lan",)) -> tuple[Bridge, Clock]:
+class Transport:
+    def __init__(self) -> None:
+        self.sent: list[tuple[str, Any, bool]] = []
+
+    def publish(self, topic: str, payload: str, *, retain: bool = False) -> None:
+        self.sent.append((topic, json.loads(payload), retain))
+
+    def subscribe(self, topic: str, callback: Any) -> None:
+        pass
+
+    def last(self, topic: str) -> Any:
+        return next(payload for sent, payload, _ in reversed(self.sent) if sent == f"tuyapilot2mqtt/{topic}")
+
+    def all(self, topic: str) -> list[Any]:
+        return [payload for sent, payload, _ in self.sent if sent == f"tuyapilot2mqtt/{topic}"]
+
+
+class Lan:
+    def __init__(self, clock: Clock, values: dict[str, dict[str, Any]]) -> None:
+        self.clock, self.values = clock, values
+
+    def read(self, listed: Any) -> list[Reading]:
+        return [
+            Reading(d.dev_id, Channel.LAN, self.clock(), self.values[d.dev_id])
+            for d in listed
+            if self.values.get(d.dev_id)
+        ]
+
+
+class Sharing:
+    """A made-up account: ``send`` changes what ``read`` returns, unless ``deaf``."""
+
+    def __init__(self, clock: Clock) -> None:
+        self.clock = clock
+        self.sent: list[tuple[str, list[dict[str, Any]]]] = []
+        self.deaf = False
+        self.failing = False
+        self.status = {
+            A: {"switch": True, "mode": "manual", "temperature": 19.5, "setpoint": 20.0, "fault": 0},
+            B: {"switch": True, "mode": "program", "temperature": 18.0, "setpoint": 9.0, "fault": 2},
+        }
+
+    def discover(self) -> list[Device]:
+        if self.failing:
+            raise ChannelError("down")
+        return [
+            Device(A, "Room A", "fu1bfwza", "wk", None, "na", True),
+            Device(B, "Room/B #1", "fu1bfwza", "wk", None, "A4C1380000000ABC", True),
+            Device("gateway1", "Gateway", "gatewayp", "wg2", None, None, True),
+        ]
+
+    def spec(self, dev_id: str) -> DeviceSpec:
+        return DeviceSpec.from_instruction_set(
+            "fu1bfwza",
+            [
+                {"code": "temp_set", "type": "Integer", "values": {"min": 50, "max": 400, "step": 5}},
+                {"code": "switch", "type": "Boolean", "values": {}},
+                {"code": "mode", "type": "Enum", "values": {"range": ["eco", "holiday", "program", "manual"]}},
+            ],
+            [{"code": "fault", "type": "Bitmap", "values": {"label": ["e1", "e2", "e3"]}}],
+        )
+
+    def read(self, dev_ids: list[str]) -> list[Reading]:
+        if self.failing:
+            raise ChannelError("down")
+        return [Reading(d, Channel.SHARING, self.clock(), dict(self.status[d]), online=True) for d in dev_ids]
+
+    def send(self, dev_id: str, commands: list[dict[str, Any]]) -> None:
+        self.sent.append((dev_id, commands))
+        if not self.deaf:
+            self.status[dev_id]["setpoint"] = commands[0]["value"] / 10
+
+
+LAN_FULL = {
+    A: {"switch": True, "mode": "manual", "temperature": 19.4, "setpoint": 20.0, "energy": 12.3, "heating": False,
+        "power": 0.0, "frost_setpoint": 7.0, "eco_setpoint": 16.0},
+    B: {"temperature": 18.1, "mode": "hors", "voltage": 230.0, "current_ma": 4000, "heating": True, "power": 920.0},
+}  # fmt: skip
+
+
+def make(
+    *, sharing: Any = None, with_lan: bool = True, **options: Any
+) -> tuple[Bridge, Transport, Clock, Any]:
     clock = Clock()
-    gateway, thermostats = devices.parse(ENTRIES, "fu1bfwza")
-    lan = LanChannel(gateway, thermostats, lambda _g, _t: {NODES.get(k, k): v for k, v in readings.items()}, clock)
-    return Bridge(config.Settings(channels=channels), thermostats, lan, clock), clock
+    transport = Transport()
+    channels = (("lan",) if with_lan else ()) + (("sharing",) if sharing is not None else ())
+    if sharing == "account":
+        sharing = Sharing(clock)
+    settings = config.Settings(channels=channels, **options)
+    bridge = Bridge(
+        transport,
+        settings,
+        sharing=sharing,
+        lan=Lan(clock, LAN_FULL) if with_lan else None,
+        local=LOCAL if with_lan else None,
+        clock=clock,
+        gate_options={"sleep": lambda _s: None, "monotonic": clock},
+    )
+    bridge.start()
+    bridge.poll()
+    return bridge, transport, clock, sharing
 
 
-def by_topic(messages: list) -> dict[str, object]:
-    return {m.topic: json.loads(m.payload) for m in messages}
+def set_(bridge: Bridge, name: str, payload: Any) -> None:
+    bridge.handle_message(f"tuyapilot2mqtt/{name}/set", payload if isinstance(payload, str) else json.dumps(payload))
 
 
-def test_devices_from_keys_file() -> None:
-    gateway, thermostats = devices.parse(ENTRIES, "fu1bfwza")
-    assert gateway.dev_id == "gw"
-    assert "k" not in repr(gateway).replace("key", "")
-    assert [t.friendly_name for t in thermostats] == ["Room A", "Room B 1"]
-    assert [t.product_id_source for t in thermostats] == ["file", "config"]
-    descriptor = thermostats[0].descriptor()
-    assert "ieee_address" not in descriptor  # "na" is not an EUI-64
-    assert thermostats[1].descriptor()["ieee_address"] == "0xa4c1380000000abc"
-    assert descriptor["definition"]["model"] == "TS0601_fu1bfwza"
-    assert descriptor["supported"] is True
-    assert descriptor["tuya"] == {
-        "dev_id": "a",
-        "product_id": "fu1bfwza",
-        "product_id_source": "file",
-        "category": "wk",
-        "gateway": "gw",
-    }
+# --- keys file --------------------------------------------------------------------------------
 
 
-def test_friendly_names_are_unique_and_topic_safe() -> None:
-    assert devices.friendly_names(["A", "A", "a/b+c#", ""]) == ["A", "A 2", "a b c", "thermostat 4"]
-
-
-def test_unknown_product_is_listed_unsupported_and_never_published() -> None:
-    _, thermostats = devices.parse(ENTRIES, "otherproduct")
-    unsupported = next(t for t in thermostats if t.dev_id == "b")
-    assert unsupported.descriptor()["supported"] is False
-    assert unsupported.descriptor()["definition"] is None
-
-
-def test_keys_file_needs_exactly_one_gateway() -> None:
-    with pytest.raises(devices.DevicesError):
+def test_keys_file_gives_the_gateway_and_the_supported_thermostats() -> None:
+    assert LOCAL.gateway_id == "gateway1"
+    assert "kkkk" not in repr(LOCAL)
+    assert [d.dev_id for d in LOCAL.devices] == [B, A]  # the plug and the unknown product are left out
+    assert LOCAL.product_id_source(A) == "file" and LOCAL.product_id_source(B) == "config"
+    with pytest.raises(devices.DevicesError, match="exactly one gateway"):
         devices.parse(ENTRIES[1:], "fu1bfwza")
+    with pytest.raises(devices.DevicesError, match="JSON list"):
+        devices.parse({}, "fu1bfwza")
 
 
-def test_state_holds_only_what_was_read() -> None:
-    bridge, _ = make({"na": {"16": 195, "124": "closed"}, "nb": None})
-    messages = by_topic(bridge.poll())
-    state = messages["tuyapilot2mqtt/Room A"]
-    assert {k for k in state if k not in ("tuya", "last_seen")} == {"local_temperature", "running_state", "power"}
-    assert state["local_temperature"] == 19.5
-    assert state["running_state"] == "idle" and state["power"] == 0.0
-    assert set(state["tuya"]["read"]) == {"local_temperature", "running_state", "power"}
-    assert state["tuya"]["read"]["power"] == {"channel": "lan", "at": "2027-01-15T08:00:00Z"}
-    assert "mode" not in state["tuya"]
-    assert "tuyapilot2mqtt/Room B 1" not in messages
-    assert messages["tuyapilot2mqtt/Room A/availability"] == {"state": "online"}
-    assert messages["tuyapilot2mqtt/Room B 1/availability"] == {"state": "offline"}
+def test_keys_file_errors_name_no_path(tmp_path: Any) -> None:
+    with pytest.raises(devices.DevicesError, match="not found"):
+        devices.load(tmp_path / "missing.json", "fu1bfwza")
+    bad = tmp_path / "bad.json"
+    bad.write_text("{", encoding="utf-8")
+    with pytest.raises(devices.DevicesError, match="not JSON"):
+        devices.load(bad, "fu1bfwza")
 
 
-def test_full_reading_while_heating() -> None:
-    dps = {"1": True, "2": "program", "16": 182, "17": "open", "20": 5, "24": 120, "50": 205,
-           "101": 2305, "102": 4300, "107": 1234, "116": 70, "117": 160, "124": "opened"}  # fmt: skip
-    bridge, _ = make({"na": dps})
-    state = by_topic(bridge.poll())["tuyapilot2mqtt/Room A"]
-    assert state["system_mode"] == "heat" and state["preset"] == "program"
-    assert state["current_heating_setpoint"] == 20.5 and state["holiday_temperature"] == 12.0
-    assert state["antifrost_temperature"] == 7.0 and state["eco_temperature"] == 16.0
-    assert state["window_open"] is True and state["fault"] == ["bit_0", "bit_2"]
-    assert state["running_state"] == "heat"
-    assert state["voltage"] == 230.5 and state["current"] == 4.3 and state["power"] == 991.1
-    assert state["energy"] == 123.4
-    assert state["tuya"]["mode"] == "program"
-    for absent in ("window_detection", "child_lock", "local_temperature_calibration"):
-        assert absent not in state
+# --- LAN alone: what versions 1 and 2 published -------------------------------------------------
 
 
-def test_undeclared_mode_gives_no_preset_and_stays_readable() -> None:
-    state, _ = dialect.to_state({"mode": "something_else", "switch": False})
-    assert "preset" not in state and state["system_mode"] == "off"
-    bridge, _ = make({"na": {"2": "something_else"}})
-    assert by_topic(bridge.poll())["tuyapilot2mqtt/Room A"]["tuya"]["mode"] == "something_else"
+def test_lan_alone_publishes_every_property_it_read() -> None:
+    bridge, transport, _, _ = make()
+    assert [d["friendly_name"] for d in transport.last("bridge/devices")] == ["Room A", "Room B 1"]
+    a, b = transport.last("bridge/devices")
+    assert "ieee_address" not in a and b["ieee_address"] == "0xa4c1380000000abc"
+    assert a["definition"] == {"vendor": "Tuya", "model": "TS0601_fu1bfwza", "description": "Pilot-wire thermostat"}
+    assert a["tuya"] == {
+        "dev_id": A, "product_id": "fu1bfwza", "product_id_source": "file", "category": "wk", "gateway": "gateway1",
+    }  # fmt: skip
+    assert b["tuya"]["product_id_source"] == "config"
+
+    state = transport.last("Room A")
+    assert state["local_temperature"] == 19.4 and state["current_heating_setpoint"] == 20.0
+    assert state["system_mode"] == "heat" and state["preset"] == "manual" and state["running_state"] == "idle"
+    assert state["antifrost_temperature"] == 7.0 and "frost_protection_temperature" not in state
+    assert state["last_seen"] == "2027-01-15T08:00:00Z"
+    assert state["tuya"]["read"]["antifrost_temperature"] == {"channel": "lan", "at": "2027-01-15T08:00:00Z"}
+    assert "sources" not in state["tuya"]
+
+    other = transport.last("Room B 1")
+    assert other["preset"] == "antifrost" and other["tuya"]["mode"] == "hors"
+    assert other["power"] == 920.0 and other["current"] == 4.0
+    assert "system_mode" not in other  # not read: absent, never guessed
+
+    assert transport.last("Room A/availability") == {"state": "online"}
+    info = transport.last("bridge/info")
+    assert info["version"] == "0.2.0" and info["contract"] == CONTRACT_VERSION == 3
+    assert info["read_only"] is True
+    assert info["writes"] == {
+        "enabled": False, "keys": ["current_heating_setpoint"], "device": None,
+        "closed": "writes are disabled in the options",
+    }  # fmt: skip
+    assert info["channels"]["lan"]["state"] == "online"
+    assert info["channels"]["sharing"] == info["channels"]["developer"] == {"enabled": False}
 
 
-def test_voltage_and_current_only_while_heating() -> None:
-    state, _ = dialect.to_state({"voltage": 230.0, "current_ma": 0, "heating": False, "power": 0.0})
-    assert "voltage" not in state and "current" not in state and state["power"] == 0.0
-
-
-def test_partial_reads_are_merged_with_the_time_each_was_read() -> None:
-    readings: dict = {"na": {"16": 195, "50": 200}}
-    bridge, clock = make(readings)
+def test_a_device_goes_offline_when_its_last_reading_is_old() -> None:
+    bridge, transport, clock, _ = make()
+    bridge.lan.values = {A: LAN_FULL[A]}
+    clock.now += 700
     bridge.poll()
+    assert transport.last("Room A/availability") == {"state": "online"}
+    assert transport.last("Room B 1/availability") == {"state": "offline"}
+    assert len(transport.all("Room B 1")) == 1  # no state republished for a device that did not answer
+
+
+def test_republish_sends_everything_retained_again() -> None:
+    bridge, transport, _, _ = make()
+    transport.sent.clear()
+    bridge.republish()
+    topics = [topic.removeprefix("tuyapilot2mqtt/") for topic, _, retain in transport.sent if retain]
+    assert sorted(topics) == sorted([
+        "bridge/state", "bridge/info", "bridge/devices", "Room A", "Room B 1",
+        "Room A/availability", "Room B 1/availability",
+    ])  # fmt: skip
+
+
+# --- sharing channel ----------------------------------------------------------------------------
+
+
+def test_without_a_session_the_lan_keeps_publishing_and_the_login_state_is_said() -> None:
+    bridge, transport, clock, _ = make(sharing=session.NoSession())
+    assert transport.last("Room A")["local_temperature"] == 19.4  # the LAN stands in
+    assert transport.last("Room A/availability") == {"state": "online"}
+    info = transport.last("bridge/info")
+    assert info["channels"]["sharing"]["state"] == "unauthenticated" and info["read_only"] is True
+
+    bridge._login_state = lambda: (session.WAITING_FOR_SCAN, "scan")
+    bridge.publish_info()
+    assert transport.last("bridge/info")["channels"]["sharing"] == {
+        "enabled": True, "state": "waiting_for_scan", "error": "scan",
+    }  # fmt: skip
+
+    # The owner scanned: the account lists the devices, each channel feeds what is proven for it.
     clock.now += 60
-    readings["na"] = {"16": 196}
-    state = by_topic(bridge.poll())["tuyapilot2mqtt/Room A"]
-    assert state["local_temperature"] == 19.6 and state["current_heating_setpoint"] == 20.0
-    assert state["tuya"]["read"]["local_temperature"]["at"] == "2027-01-15T08:01:00Z"
-    assert state["tuya"]["read"]["current_heating_setpoint"]["at"] == "2027-01-15T08:00:00Z"
-    assert state["last_seen"] == "2027-01-15T08:01:00Z"
-
-
-def test_offline_after_consecutive_misses_and_state_not_republished() -> None:
-    readings: dict = {"na": {"16": 195}}
-    bridge, _ = make(readings)
+    bridge.resume_sharing(Sharing(clock))
     bridge.poll()
-    readings["na"] = None
-    for miss in range(1, MISSES_BEFORE_OFFLINE + 1):
-        messages = by_topic(bridge.poll())
-        assert "tuyapilot2mqtt/Room A" not in messages
-        expected = "offline" if miss == MISSES_BEFORE_OFFLINE else "online"
-        assert messages["tuyapilot2mqtt/Room A/availability"] == {"state": expected}
+    assert [d["friendly_name"] for d in transport.last("bridge/devices")] == ["Room A", "Room B 1"]
+    descriptor = transport.last("bridge/devices")[0]
+    assert descriptor["tuya"]["product_id_source"] == "account" and descriptor["tuya"]["gateway"] == "gateway1"
+    state = transport.last("Room A")
+    assert state["local_temperature"] == 19.5 and state["tuya"]["read"]["local_temperature"]["channel"] == "sharing"
+    assert state["tuya"]["read"]["energy"]["channel"] == "lan"
+    assert transport.last("Room B 1")["fault"] == ["e2"]
+    assert transport.last("bridge/info")["channels"]["sharing"]["state"] == "online"
 
 
-def test_reader_failure_is_survived_and_reported() -> None:
-    def broken(_g: object, _t: object) -> dict:
-        raise OSError("unreachable")
-
-    gateway, thermostats = devices.parse(ENTRIES, "fu1bfwza")
-    bridge = Bridge(config.Settings(), thermostats, LanChannel(gateway, thermostats, broken))
-    info = by_topic(bridge.poll())["tuyapilot2mqtt/bridge/info"]
-    assert info["channels"]["lan"]["state"] == "offline" and info["channels"]["lan"]["error"] == "OSError"
-
-
-def test_bridge_topics() -> None:
-    bridge, _ = make({}, channels=("lan", "sharing"))
-    messages = bridge.startup()
-    assert all(m.retain for m in messages)
-    topics = by_topic(messages)
-    assert topics["tuyapilot2mqtt/bridge/state"] == {"state": "online"}
-    info = topics["tuyapilot2mqtt/bridge/info"]
-    assert info["contract"] == CONTRACT_VERSION and info["read_only"] is True
-    assert info["channels"]["lan"]["state"] == "starting"
-    assert info["channels"]["sharing"] == {"enabled": True, "state": "unsupported"}
-    assert info["channels"]["developer"] == {"enabled": False}
-    assert [d["friendly_name"] for d in topics["tuyapilot2mqtt/bridge/devices"]] == ["Room A", "Room B 1"]
-    assert topics["tuyapilot2mqtt/Room A/availability"] == {"state": "offline"}
-    assert bridge.subscriptions == ["tuyapilot2mqtt/+/set", "tuyapilot2mqtt/bridge/request/#"]
+def test_a_failing_account_never_empties_the_device_list() -> None:
+    bridge, transport, clock, sharing = make(sharing="account")
+    listed = transport.last("bridge/devices")
+    sharing.failing = True
+    clock.now += 7 * 3600
+    bridge.poll()
+    assert transport.last("bridge/devices") == listed and len(transport.all("bridge/devices")) == 1
+    assert transport.last("bridge/info")["channels"]["sharing"]["state"] == "offline"
+    assert transport.last("Room A/availability") == {"state": "online"}  # the LAN still reads it
 
 
-def test_set_is_refused() -> None:
-    bridge, _ = make({})
-    (answer,) = bridge.handle("tuyapilot2mqtt/Room A/set", b'{"current_heating_setpoint": 19.5, "transaction": 7}')
-    assert answer.topic == "tuyapilot2mqtt/bridge/response/device/set" and answer.retain is False
-    body = json.loads(answer.payload)
-    assert body["status"] == "error" and "read-only" in body["error"] and body["transaction"] == 7
-    assert body["data"] == {"device": "Room A", "keys": ["current_heating_setpoint"]}
-    (unknown,) = bridge.handle("tuyapilot2mqtt/Nowhere/set", b"not json")
-    assert json.loads(unknown.payload)["error"].startswith("unknown device")
+def test_no_channel_at_all_publishes_no_device() -> None:
+    _, transport, _, _ = make(with_lan=False)
+    assert transport.all("bridge/devices") == []
+    assert transport.last("bridge/info")["read_only"] is True
 
 
-def test_requests_are_refused() -> None:
-    bridge, _ = make({})
-    (answer,) = bridge.handle("tuyapilot2mqtt/bridge/request/schedule/set", b'{"device": "Room A", "days": {}}')
-    assert answer.topic == "tuyapilot2mqtt/bridge/response/schedule/set"
-    assert json.loads(answer.payload)["status"] == "error"
-    assert bridge.handle("other/Room A/set", b"{}") == []
-    assert bridge.handle("tuyapilot2mqtt/Room A", b"{}") == []
+def test_channel_enabled_but_not_buildable_is_unavailable() -> None:
+    bridge = Bridge(
+        Transport(), config.Settings(channels=("developer",)), unavailable={"developer": "credentials are empty"}
+    )
+    bridge.publish_info()
+    assert bridge.transport.last("bridge/info")["channels"]["developer"] == {
+        "enabled": True, "state": "unavailable", "error": "credentials are empty",
+    }  # fmt: skip
 
 
-def test_settings_from_file_and_environment(tmp_path) -> None:  # noqa: ANN001
+# --- the single write ---------------------------------------------------------------------------
+
+OPEN = {"sharing": "account", "writes_enabled": True, "write_device": "Room A"}
+
+
+def test_closed_by_default_every_set_is_refused_and_nothing_is_sent() -> None:
+    bridge, transport, _, sharing = make(sharing="account")
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "t1"})
+    assert transport.last("bridge/response/device/set") == {
+        "status": "error",
+        "data": {"device": "Room A", "keys": ["current_heating_setpoint"]},
+        "error": "read-only bridge: writes are disabled in the options; nothing was sent to the device",
+        "transaction": "t1",
+    }
+    set_(bridge, "Nowhere", {"current_heating_setpoint": 20.5})
+    assert transport.last("bridge/response/device/set")["error"].startswith("unknown device")
+    set_(bridge, "Room A", "not json")
+    assert transport.last("bridge/response/device/set")["error"].startswith("payload is not a JSON object")
+    assert sharing.sent == []
+
+
+@pytest.mark.parametrize(
+    ("options", "reason"),
+    [
+        ({"writes_enabled": True}, "no thermostat is designated in the options"),
+        ({"writes_enabled": True, "write_device": "Room Z"}, "the designated thermostat is not among the devices"),
+        ({"write_device": "Room A"}, "writes are disabled in the options"),
+    ],
+)
+def test_read_only_until_everything_is_in_place(options: dict[str, Any], reason: str) -> None:
+    bridge, transport, _, sharing = make(sharing="account", **options)
+    info = transport.last("bridge/info")
+    assert info["read_only"] is True and info["writes"]["closed"] == reason
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert reason in transport.last("bridge/response/device/set")["error"] and sharing.sent == []
+
+
+def test_read_only_without_a_connected_sharing_channel() -> None:
+    bridge, transport, _, _ = make(writes_enabled=True, write_device="Room A")
+    assert transport.last("bridge/info")["writes"]["closed"] == "the sharing channel is not enabled"
+    bridge, transport, _, _ = make(sharing=session.NoSession(), writes_enabled=True, write_device="Room A")
+    info = transport.last("bridge/info")
+    assert info["read_only"] is True and info["writes"]["closed"] == "the sharing channel is not connected"
+
+
+def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    info = transport.last("bridge/info")
+    assert info["read_only"] is False and info["writes"] == {
+        "enabled": True, "keys": ["current_heating_setpoint"], "device": "Room A",
+    }  # fmt: skip
+    clock.now += 5
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "abc"})
+    assert sharing.sent == [(A, [{"code": "temp_set", "value": 205}])]
+    assert transport.last("bridge/response/device/set") == {
+        "status": "ok",
+        "data": {
+            "device": "Room A",
+            "results": [{"property": "current_heating_setpoint", "value": 20.5, "confirmed": True}],
+        },
+        "transaction": "abc",
+    }
+    state = transport.last("Room A")
+    assert state["current_heating_setpoint"] == 20.5
+    assert state["tuya"]["read"]["current_heating_setpoint"] == {"channel": "sharing", "at": "2027-01-15T08:00:05Z"}
+
+
+def test_designation_by_device_id() -> None:
+    bridge, transport, _, sharing = make(sharing="account", writes_enabled=True, write_device=B)
+    assert transport.last("bridge/info")["writes"]["device"] == "Room B 1"
+    set_(bridge, "Room B 1", {"current_heating_setpoint": 10})
+    assert sharing.sent == [(B, [{"code": "temp_set", "value": 100}])]
+
+
+@pytest.mark.parametrize(
+    ("name", "payload", "error"),
+    [
+        ("Room B 1", {"current_heating_setpoint": 20.5}, "designated thermostat only"),
+        ("Room A", {"system_mode": "off"}, "only current_heating_setpoint"),
+        ("Room A", {"preset": "eco"}, "only current_heating_setpoint"),
+        ("Room A", {"current_heating_setpoint": 20.5, "system_mode": "off"}, "only current_heating_setpoint"),
+        ("Room A", {"transaction": "x"}, "only current_heating_setpoint"),
+        ("Room A", {"current_heating_setpoint": 20.3}, "not on the device's step"),
+        ("Room A", {"current_heating_setpoint": 4.5}, "outside the device's bounds"),
+        ("Room A", {"current_heating_setpoint": 30.5}, "above the ceiling"),
+        ("Room A", {"current_heating_setpoint": "20"}, "expected a number"),
+        ("Room A", {"current_heating_setpoint": True}, "expected a number"),
+    ],
+)
+def test_everything_else_is_refused_before_anything_is_sent(name: str, payload: Any, error: str) -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    before = transport.last("Room A")
+    set_(bridge, name, payload)
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and error in response["error"]
+    assert sharing.sent == [] and transport.last("Room A") == before
+
+
+def test_refused_in_frost_protection_and_when_offline() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    sharing.status[A]["mode"] = "hors"
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert "frost-protection mode" in transport.last("bridge/response/device/set")["error"]
+    sharing.status[A]["mode"] = "manual"
+    sharing.read = lambda ids: [Reading(d, Channel.SHARING, 0.0, dict(sharing.status[d]), online=False) for d in ids]
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5})
+    assert "offline" in transport.last("bridge/response/device/set")["error"]
+    assert sharing.sent == []
+
+
+def test_a_write_the_device_did_not_take_is_an_error_and_the_state_is_what_was_read() -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    sharing.deaf = True
+    real_read = sharing.read
+
+    def read(ids: list[str]) -> list[Reading]:
+        clock.now += 5
+        return real_read(ids)
+
+    sharing.read = read
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "t"})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and "not confirmed" in response["error"] and response["transaction"] == "t"
+    assert response["data"]["results"][0]["confirmed"] is False
+    assert len(sharing.sent) == 1  # sent once, never retried
+    assert transport.last("Room A")["current_heating_setpoint"] == 20.0  # no optimistic state
+
+
+def test_an_unexpected_failure_still_answers() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+
+    def boom(dev_id: str, commands: Any) -> None:
+        raise RuntimeError("boom")
+
+    sharing.send = boom
+    set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "t"})
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "error" and "internal error (RuntimeError)" in response["error"]
+    assert response["transaction"] == "t"
+
+
+def test_the_write_closes_when_the_sharing_channel_fails() -> None:
+    bridge, transport, clock, sharing = make(**OPEN)
+    sharing.failing = True
+    clock.now += 60
+    bridge.poll()
+    info = transport.last("bridge/info")
+    assert info["read_only"] is True and info["writes"]["closed"] == "the sharing channel is not connected"
+
+
+def test_every_request_is_refused() -> None:
+    bridge, transport, _, sharing = make(**OPEN)
+    for action in ("schedule/get", "schedule/set", "anything"):
+        bridge.handle_message(f"tuyapilot2mqtt/bridge/request/{action}", '{"device": "Room A", "transaction": 7}')
+        assert transport.last(f"bridge/response/{action}") == {
+            "status": "error",
+            "data": {},
+            "error": "request not available in this version; nothing was sent to the device",
+            "transaction": 7,
+        }
+    bridge.handle_message("tuyapilot2mqtt/bridge/request/schedule/get", "garbage")
+    assert transport.last("bridge/response/schedule/get")["status"] == "error"
+    assert sharing.sent == []
+
+
+def test_the_gate_itself_refuses_what_the_bridge_filters() -> None:
+    bridge, _, _, sharing = make(**OPEN)
+    gate = bridge.gate
+    assert isinstance(gate, TrialGate) and gate.designated == A
+    a, b = bridge.devices[A], bridge.devices[B]
+    with pytest.raises(WriteRefused, match="only current_heating_setpoint"):
+        gate.plan(a, sharing.spec(A), "switch", False)
+    with pytest.raises(WriteRefused, match="designated thermostat only"):
+        gate.plan(b, sharing.spec(B), "setpoint", 20.0)
+    with pytest.raises(WriteRefused, match="weekly schedule"):
+        gate.write_schedule(a, {"monday": []})
+    gate.designated = None
+    with pytest.raises(WriteRefused, match="designated thermostat only"):
+        gate.plan(a, sharing.spec(A), "setpoint", 20.0)
+
+
+# --- contract names -----------------------------------------------------------------------------
+
+
+def test_contract_names_over_the_library_codec() -> None:
+    encoded = {
+        "preset": "schedule",
+        "frost_protection_temperature": 7.0,
+        "tuya": {"mode": "program", "sources": {"frost_protection_temperature": {"channel": "lan", "at": "x+00:00"}}},
+    }
+    assert contract.state(encoded, None) == {
+        "preset": "program",
+        "antifrost_temperature": 7.0,
+        "tuya": {"mode": "program", "read": {"antifrost_temperature": {"channel": "lan", "at": "xZ"}}},
+    }
+    assert contract.state({"preset": "frost_protection"}, 0.0) == {
+        "preset": "antifrost", "last_seen": "1970-01-01T00:00:00Z", "tuya": {"read": {}},
+    }  # fmt: skip
+
+
+# --- session and login --------------------------------------------------------------------------
+
+
+def test_session_file_is_private_and_survives_garbage(tmp_path: Any) -> None:
+    store = session.SessionStore(tmp_path / "sub" / "session.json")
+    assert store.load() is None
+    store.save({"user_code": "u"})
+    assert store.load() == {"user_code": "u"}
+    assert stat.S_IMODE(store.path.stat().st_mode) == 0o600
+    store.path.write_text("[1]", encoding="utf-8")
+    assert store.load() is None
+
+
+def test_qr_code_renders_as_text_lines() -> None:
+    lines = session.render_qr("tuyaSmart--qrLogin?token=synthetic")
+    assert len(lines) > 10 and len({len(line) for line in lines}) == 1
+    assert all(line.startswith("\x1b[30;47m") and line.endswith("\x1b[0m") for line in lines)
+
+
+def test_login_waits_for_a_user_code() -> None:
+    login = session.Login("", request=lambda code: pytest.fail("no request"), poll=lambda qr, code: None)
+    assert login.tick() is None
+    assert login.state == session.LOGIN_REQUIRED and "sharing_user_code" in login.detail
+
+
+def test_login_shows_a_code_then_returns_the_session() -> None:
+    clock = Clock()
+    shown: list[str] = []
+    answers: list[Any] = [None, RuntimeError("network"), "the session"]
+
+    def poll(qr: str, code: str) -> Any:
+        answer = answers.pop(0)
+        if isinstance(answer, Exception):
+            raise answer
+        return answer
+
+    login = session.Login("code", request=lambda code: f"qr-{len(shown)}", poll=poll, show=shown.append, clock=clock)
+    assert login.tick() is None and shown == ["qr-0"] and login.state == session.WAITING_FOR_SCAN
+    assert login.tick() is None and len(answers) == 3  # paced: nothing asked before the interval
+    for _ in range(2):
+        clock.now += session.POLL_INTERVAL
+        assert login.tick() is None
+    clock.now += session.POLL_INTERVAL
+    assert login.tick() == "the session"
+
+
+def test_login_renews_the_code_then_gives_up() -> None:
+    clock = Clock()
+    shown: list[str] = []
+    login = session.Login(
+        "code", request=lambda code: "qr", poll=lambda qr, code: None, show=shown.append, clock=clock
+    )
+    for _ in range(session.MAX_QR_CODES + 3):
+        login.tick()
+        clock.now += session.QR_LIFETIME
+    assert len(shown) == session.MAX_QR_CODES and login.state == session.LOGIN_EXPIRED
+
+
+def test_login_says_when_the_code_request_fails() -> None:
+    def refuse(code: str) -> str:
+        raise ChannelError("refused")
+
+    login = session.Login("code", request=refuse, poll=lambda qr, code: None, clock=Clock())
+    assert login.tick() is None
+    assert login.state == session.LOGIN_REQUIRED and "ChannelError" in login.detail
+
+
+def test_no_session_refuses_every_call() -> None:
+    from pytuya_pilot_wire.errors import AuthenticationError
+
+    stand_in = session.NoSession()
+    for call in (stand_in.discover, lambda: stand_in.read(["x"]), lambda: stand_in.send("x", [])):
+        with pytest.raises(AuthenticationError):
+            call()
+    assert stand_in.spec("x") is None
+
+
+# --- settings and entry point -------------------------------------------------------------------
+
+
+def test_settings_defaults_are_read_only_and_hide_secrets(tmp_path: Any) -> None:
+    defaults = config.Settings()
+    assert defaults.writes_enabled is False and defaults.write_device == "" and defaults.channels == ("lan",)
     options = tmp_path / "options.json"
-    options.write_text(json.dumps({"base_topic": "t", "mqtt_host": "", "mqtt_port": 1883, "poll_interval": 120,
-                                   "channels": ["lan", "sharing"], "mqtt_tls": False}))  # fmt: skip
-    env = {"TUYAPILOT_MQTT_HOST": "broker", "TUYAPILOT_MQTT_PORT": "8883", "TUYAPILOT_MQTT_PASSWORD": "s3"}
-    s = config.load(options, env)
-    assert (s.base_topic, s.mqtt_host, s.mqtt_port, s.poll_interval) == ("t", "broker", 8883, 120)
-    assert s.channels == ("lan", "sharing") and "s3" not in repr(s)
-    for bad in ({"poll_interval": 5}, {"channels": ["zigbee"]}, {"base_topic": "a/#"}, {"mqtt_port": "x"}):
-        options.write_text(json.dumps(bad))
+    options.write_text(
+        json.dumps({"poll_interval": 120, "channels": ["lan", "sharing"], "mqtt_password": "", "writes_enabled": True}),
+        encoding="utf-8",
+    )
+    env = {"TUYAPILOT_SHARING_USER_CODE": "secretcode", "TUYAPILOT_DEVELOPER_ACCESS_SECRET": "secretkey"}
+    settings = config.load(options, env)
+    assert settings.poll_interval == 120 and settings.channels == ("lan", "sharing") and settings.writes_enabled
+    assert "secretcode" not in repr(settings) and "secretkey" not in repr(settings)
+    for bad in ({"poll_interval": 5}, {"channels": ["cloud"]}, {"base_topic": "a/#"}, {"developer_region": "mars"}):
+        options.write_text(json.dumps(bad), encoding="utf-8")
         with pytest.raises(config.ConfigError):
             config.load(options, {})
+    with pytest.raises(config.ConfigError, match="unusable"):
+        config.load(None, {"TUYAPILOT_MQTT_TLS": "maybe"})
 
 
-def test_dry_run_prints_the_contract_topics(capsys) -> None:  # noqa: ANN001
+def test_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
     assert cli.main(["--dry-run"]) == 0
     out = capsys.readouterr().out
-    assert "tuyapilot2mqtt/bridge/state" in out and "bridge/response/device/set" in out and "dry run OK" in out
+    assert "dry run OK" in out and '"read_only": false' in out and '"status": "ok"' in out
 
 
-def test_lan_channel_without_gateway_address_is_a_config_error() -> None:
-    assert cli.main([]) == 2
+def test_lan_channel_needs_the_gateway_address() -> None:
+    assert cli.main(["--options", "/nonexistent"]) == 2

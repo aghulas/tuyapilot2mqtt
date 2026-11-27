@@ -1,185 +1,348 @@
-"""The contract's messages, built from what the channels read. No I/O here.
+"""The bridge: the daemon core of ``pytuya-pilot-wire``, publishing this repository's contract.
 
-READ ONLY: ``/set`` and ``bridge/request/*`` are answered by an explicit refusal and nothing is
-sent to a device.
+The read loop, the channel health, the routing, the write gate and the read-back are the
+library's (:class:`pytuya_pilot_wire.bridge.Bridge`). What is here is what the contract of this
+repository says beyond the library's draft-0 codec, and the policy of this version:
+
+- ``bridge/info``, descriptors and state objects in the shape of ``docs/mqtt-contract.md``;
+- the thermostats of the local keys file when the sharing channel has no session yet, and the LAN
+  readings standing in for the state while the sharing channel is not connected;
+- **one write only**: ``current_heating_setpoint``, on the one thermostat the owner designated,
+  when the owner enabled writes and the sharing channel is connected. Everything else on
+  ``/set`` and every ``bridge/request/*`` is refused before the library sees it, and refused a
+  second time by the gate.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
-import time
-from collections.abc import Callable
-from datetime import UTC, datetime
-from typing import Any, NamedTuple
+import logging
+from collections.abc import Callable, Mapping
+from typing import Any
 
 from pytuya_pilot_wire import __version__ as library_version
-from pytuya_pilot_wire import dps as library_dps
+from pytuya_pilot_wire import dialect
+from pytuya_pilot_wire.bridge import Bridge as LibraryBridge
+from pytuya_pilot_wire.bridge import BridgeConfig
+from pytuya_pilot_wire.errors import WriteRefused
+from pytuya_pilot_wire.gate import PlannedWrite, ScheduleResult, WriteGate
+from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, DeviceState, Reading
 
-from . import CONTRACT_VERSION, __version__
+from . import CONTRACT_VERSION, __version__, contract
 from .config import CHANNELS, Settings
-from .devices import Thermostat
-from .dialect import to_state
-from .lan import LanChannel
+from .devices import LocalInventory
 
-# A device is published offline after this many consecutive passes without an answer: the gateway
-# drops a read now and then, and one missed pass is not an outage.
-MISSES_BEFORE_OFFLINE = 3
+log = logging.getLogger("tuyapilot2mqtt")
 
-READ_ONLY_ERROR = "read-only bridge: no write route is open in this version, nothing was sent to the device"
-REQUEST_ERROR = "request not available in this version (read-only bridge), nothing was sent to the device"
+NOTHING_SENT = "nothing was sent to the device"
+REQUEST_ERROR = f"request not available in this version; {NOTHING_SENT}"
 
-
-class Message(NamedTuple):
-    topic: str
-    payload: str
-    retain: bool
+# Library channel states -> contract states (§1.1).
+_STATES = {"idle": "starting", "ok": "online", "error": "offline", "unauthenticated": "unauthenticated"}
+_SETPOINT_KEY = "setpoint"  # the library's model key behind `current_heating_setpoint`
 
 
-def _iso(timestamp: float) -> str:
-    return datetime.fromtimestamp(timestamp, UTC).isoformat(timespec="seconds").replace("+00:00", "Z")
+class TrialGate(WriteGate):
+    """The library's write gate, narrowed to the single write this version opens.
+
+    The manual setpoint of the designated thermostat passes on to the library's checks (route,
+    the device's own bounds and step, ceiling, fresh read, frost-protection refusal, one send,
+    read-back). Any other key, any other device and the weekly schedule stop here.
+    """
+
+    designated: str | None = None  # Tuya device id of the designated thermostat, once known
+
+    def plan(self, device: Device, spec: DeviceSpec | None, key: str, value: Any) -> PlannedWrite:
+        if key != _SETPOINT_KEY:
+            raise WriteRefused(f"only {contract.OPEN_SET_KEY} can be written in this version")
+        if self.designated is None or device.dev_id != self.designated:
+            raise WriteRefused("writes are open for the designated thermostat only")
+        return super().plan(device, spec, key, value)
+
+    def write_schedule(self, device: Device, days: Mapping[str, Any]) -> ScheduleResult:
+        raise WriteRefused("the weekly schedule cannot be written in this version")
 
 
-def _json(value: Any) -> str:
-    return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-class Bridge:
+class Bridge(LibraryBridge):
     def __init__(
         self,
+        transport: Any,
         settings: Settings,
-        thermostats: list[Thermostat],
-        lan: LanChannel | None,
-        clock: Callable[[], float] = time.time,
+        *,
+        sharing: Any = None,
+        lan: Any = None,
+        developer: Any = None,
+        local: LocalInventory | None = None,
+        unavailable: Mapping[str, str] | None = None,
+        login_state: Callable[[], tuple[str, str] | None] = lambda: None,
+        clock: Callable[[], float] | None = None,
+        gate_options: Mapping[str, Any] | None = None,
     ) -> None:
+        config = BridgeConfig(
+            prefix=settings.base_topic,
+            sharing_interval=settings.poll_interval,
+            lan_interval=settings.poll_interval,
+            writes_enabled=settings.writes_enabled,
+            bridge_version=__version__,
+        )
+        extra = {} if clock is None else {"clock": clock}
+        super().__init__(transport, sharing=sharing, lan=lan, developer=developer, config=config, **extra)
         self.settings = settings
-        self.thermostats = thermostats
-        self.lan = lan
-        self._clock = clock
-        self._by_name = {t.friendly_name: t for t in thermostats}
-        self._misses: dict[str, int] = {}
-        self._last_seen: dict[str, float] = {}
+        self.gate = TrialGate(
+            self.router, sharing=sharing, developer=None, enabled=settings.writes_enabled, **(gate_options or {})
+        )
+        self._local = local
+        # Channels enabled in the options that could not be built, with the reason (no secret in it).
+        self._unavailable = dict(unavailable or {})
+        self._login_state = login_state
+        self._sources: dict[str, str] = {}
+        self._descriptors: list[dict[str, Any]] = []
+        self._open = False
 
-    # --- topics ---------------------------------------------------------------------------
+    # -- what the options and the channels allow --------------------------------------------
 
-    def topic(self, *levels: str) -> str:
-        return "/".join((self.settings.base_topic, *levels))
+    def _sharing_connected(self) -> bool:
+        status = self.status.get(Channel.SHARING)
+        return status is not None and status.state == "ok"
 
-    @property
-    def state_topic(self) -> str:
-        return self.topic("bridge", "state")
+    def _designated(self) -> str | None:
+        """Tuya device id of the designated thermostat, when it is one of the known devices."""
+        wanted = self.settings.write_device.strip()
+        if not wanted:
+            return None
+        for dev_id, name in self.names.items():
+            if wanted in (dev_id, name):
+                return dev_id
+        return None
 
-    @property
-    def subscriptions(self) -> list[str]:
-        return [self.topic("+", "set"), self.topic("bridge", "request", "#")]
+    def closed_reason(self) -> str | None:
+        """Why no write can pass now, or ``None`` when the single write of this version is open."""
+        if not self.settings.writes_enabled:
+            return "writes are disabled in the options"
+        if not self.settings.write_device.strip():
+            return "no thermostat is designated in the options"
+        if Channel.SHARING not in self.status:
+            return "the sharing channel is not enabled"
+        if not self._sharing_connected():
+            return "the sharing channel is not connected"
+        if self._designated() is None:
+            return "the designated thermostat is not among the devices"
+        return None
 
-    @staticmethod
-    def state_payload(online: bool) -> str:
-        return _json({"state": "online" if online else "offline"})
+    # -- bridge/info ------------------------------------------------------------------------
 
-    # --- bridge topics --------------------------------------------------------------------
+    def _channel_info(self, channel: Channel) -> dict[str, Any]:
+        name = channel.value
+        if name not in self.settings.channels:
+            return {"enabled": False}
+        if name in self._unavailable:
+            return {"enabled": True, "state": "unavailable", "error": self._unavailable[name]}
+        status = self.status.get(channel)
+        if status is None:
+            return {"enabled": True, "state": "unavailable"}
+        info: dict[str, Any] = {"enabled": True, "state": _STATES.get(status.state, status.state)}
+        if status.error:
+            info["error"] = status.error
+        if status.last_ok is not None:
+            info["last_ok"] = contract.iso(status.last_ok)
+        login = self._login_state() if channel is Channel.SHARING and status.state == "unauthenticated" else None
+        if login is not None:
+            info["state"], detail = login
+            info.pop("error", None)
+            if detail:
+                info["error"] = detail
+        return info
 
-    def info(self) -> Message:
-        channels: dict[str, Any] = {}
-        for name in CHANNELS:
-            if name not in self.settings.channels:
-                channels[name] = {"enabled": False}
-            elif name == "lan" and self.lan is not None:
-                channels[name] = self.lan.status()
-            else:
-                channels[name] = {"enabled": True, "state": "unsupported"}
-        payload = {
+    def publish_info(self) -> None:
+        """Publish ``bridge/info`` (contract §1.1) when something other than a timestamp changed."""
+        reason = self.closed_reason()
+        designated = self._designated()
+        self.gate.designated = designated
+        writes: dict[str, Any] = {
+            "enabled": self.settings.writes_enabled,
+            "keys": [contract.OPEN_SET_KEY],
+            "device": self.names.get(designated) if designated else None,
+        }
+        if reason:
+            writes["closed"] = reason
+        info = {
             "version": __version__,
             "contract": CONTRACT_VERSION,
             "library": {"name": "pytuya-pilot-wire", "version": library_version},
-            "read_only": True,
+            "read_only": reason is not None,
+            "writes": writes,
             "poll_interval": self.settings.poll_interval,
-            "channels": channels,
+            "channels": {channel.value: self._channel_info(channel) for channel in Channel},
         }
-        return Message(self.topic("bridge", "info"), _json(payload), True)
+        assert set(info["channels"]) == set(CHANNELS)
+        stable = json.loads(json.dumps(info))
+        for channel in stable["channels"].values():
+            channel.pop("last_ok", None)
+        signature = json.dumps(stable, sort_keys=True)
+        if signature != self._info:
+            if (reason is None) != self._open:
+                self._open = reason is None
+                log.warning("the write of %s is now %s", contract.OPEN_SET_KEY, "OPEN" if self._open else "closed")
+            self._info = signature
+            self._publish(self._topic("bridge", "info"), info)
 
-    def devices(self) -> Message:
-        return Message(self.topic("bridge", "devices"), _json([t.descriptor() for t in self.thermostats]), True)
+    # -- discovery --------------------------------------------------------------------------
 
-    def startup(self) -> list[Message]:
-        """What is published on every (re)connection: bridge topics, and each device's availability."""
-        messages = [Message(self.state_topic, self.state_payload(True), True), self.info(), self.devices()]
-        messages += [self._availability(t) for t in self.thermostats]
-        return messages
+    def discover(self) -> bool:
+        """List the thermostats and publish ``bridge/devices``. False when nothing could be listed.
 
-    # --- devices --------------------------------------------------------------------------
+        The sharing API lists them when it is connected; until then the local keys file does. A
+        list is never replaced by an empty one because a channel failed.
+        """
+        found: list[Device] | None = None
+        if self.sharing is not None and self._usable(Channel.SHARING):
+            found = self._attempt(Channel.SHARING, self.config.sharing_interval, self.sharing.discover)
+        local = {d.dev_id: d for d in (self._local.devices if self._local else ())}
+        sources: dict[str, str] = {}
+        devices: dict[str, Device] = {}
+        if found is not None:
+            for device in found:
+                if not device.supported:
+                    continue
+                known = local.get(device.dev_id)
+                if known is not None:
+                    device = dataclasses.replace(
+                        device,
+                        gateway_id=device.gateway_id or known.gateway_id,
+                        node_id=device.node_id or known.node_id,
+                    )
+                devices[device.dev_id] = device
+                sources[device.dev_id] = "account"
+        elif not self.devices and self._local is not None:
+            devices = local
+            sources = {dev_id: self._local.product_id_source(dev_id) for dev_id in local}
+        if not devices:
+            return False
+        for dev_id in set(self.devices) - set(devices):
+            self._set_availability(dev_id, False)
+            self.states.pop(dev_id, None)
+        self.devices, self._sources = devices, sources
+        self.names = dialect.friendly_names(list(devices.values()))
+        for dev_id, device in devices.items():
+            self.states.setdefault(dev_id, DeviceState(device)).device = device
+        self._descriptors = [
+            contract.descriptor(device, self.names[dev_id], sources[dev_id])
+            for dev_id, device in sorted(devices.items(), key=lambda item: self.names[item[0]])
+        ]
+        self._publish(self._topic("bridge", "devices"), self._descriptors)
+        return True
 
-    def _online(self, t: Thermostat) -> bool:
-        return t.dev_id in self._last_seen and self._misses.get(t.dev_id, 0) < MISSES_BEFORE_OFFLINE
+    def resume_sharing(self, channel: Any) -> None:
+        """Put a logged-in sharing channel in service and list the devices again at once."""
+        self.replace_channel(Channel.SHARING, channel)
+        self._due.pop("discovery", None)
 
-    def _availability(self, t: Thermostat) -> Message:
-        return Message(self.topic(t.friendly_name, "availability"), self.state_payload(self._online(t)), True)
+    # -- reads ------------------------------------------------------------------------------
 
-    def state(self, t: Thermostat) -> dict[str, Any] | None:
-        """State object of a thermostat (contract §3), or None when nothing was ever read."""
-        if self.lan is None or not t.supported:
-            return None
-        seen = self.lan.data_points(t.dev_id)
-        if not seen:
-            return None
-        decoded = library_dps.decode_lan(t.product_id, {dp: value for dp, (value, _) in seen.items()})
-        state, origin = to_state(decoded)
-        dp_of = {point.key: str(point.dp) for point in library_dps.table(t.product_id)}
-        read = {
-            prop: {"channel": "lan", "at": _iso(min(seen[dp_of[key]][1] for key in keys))}
-            for prop, keys in origin.items()
-        }
-        extension: dict[str, Any] = {"read": read}
-        if "mode" in decoded:
-            extension["mode"] = decoded["mode"]
-        state["last_seen"] = _iso(self._last_seen[t.dev_id])
-        state["tuya"] = extension
-        return state
+    def _apply(self, channel: Channel, readings: list[Reading] | None) -> set[str]:
+        """Merge readings. While the sharing API is not connected, the LAN stands in for the state.
 
-    def poll(self) -> list[Message]:
-        """One read pass, and the messages it gives. A state is published only for a device that answered."""
-        if self.lan is None:
-            return [self.info()]
-        answered = self.lan.read()
+        Connected, each channel is trusted for the keys the library's router proves for it. The
+        LAN alone published every property in versions 1 and 2 of the contract, checked against
+        the other readers (M3); it does so again whenever the sharing channel is away.
+        """
+        if channel is not Channel.LAN or self._sharing_connected():
+            return super()._apply(channel, readings)
+        applied: set[str] = set()
+        for reading in readings or []:
+            state = self.states.get(reading.dev_id)
+            if state is None or not reading.values:
+                continue
+            state.apply(reading)
+            self._last_read[reading.dev_id] = reading.at
+            applied.add(reading.dev_id)
+        return applied
+
+    def publish_state(self, dev_id: str) -> None:
+        encoded = dialect.encode_state(self.states[dev_id], self._spec(dev_id))
+        self._publish(self._topic(self.names[dev_id]), contract.state(encoded, self._last_read.get(dev_id)))
+
+    def _refresh_availability(self) -> None:
+        """Online: a reading younger than ``stale_after`` and, when the sharing API is connected,
+        the account saying the device is online."""
         now = self._clock()
-        messages: list[Message] = []
-        for t in self.thermostats:
-            if answered.get(t.dev_id):
-                self._misses[t.dev_id] = 0
-                self._last_seen[t.dev_id] = now
-                state = self.state(t)
-                if state is not None:
-                    messages.append(Message(self.topic(t.friendly_name), _json(state), True))
-            else:
-                self._misses[t.dev_id] = self._misses.get(t.dev_id, 0) + 1
-            messages.append(self._availability(t))
-        messages.append(self.info())
-        return messages
+        connected = self._sharing_connected()
+        for dev_id, state in self.states.items():
+            last = self._last_read.get(dev_id)
+            fresh = last is not None and now - last <= self.config.stale_after
+            online = state.online is True if connected else state.online is not False
+            self._set_availability(dev_id, fresh and online)
 
-    # --- commands: refused ----------------------------------------------------------------
+    def republish(self) -> None:
+        """Everything retained, again: after a (re)connection to the broker."""
+        self.announce()
+        self._info = None
+        self.publish_info()
+        if self._descriptors:
+            self._publish(self._topic("bridge", "devices"), self._descriptors)
+        for dev_id, state in self.states.items():
+            if state.values:
+                self.publish_state(dev_id)
+        for dev_id, online in self._availability.items():
+            if dev_id in self.names:
+                self._publish(self._topic(self.names[dev_id], "availability"), dialect.encode_availability(online))
 
-    def handle(self, topic: str, payload: bytes | str) -> list[Message]:
-        """Answer a message received on a subscribed topic. Never reaches a device."""
-        prefix = self.settings.base_topic + "/"
-        if not topic.startswith(prefix):
-            return []
-        levels = topic[len(prefix) :].split("/")
+    # -- commands ---------------------------------------------------------------------------
+
+    def _refusal(self, name: str, raw: str) -> tuple[str, list[str], Any] | None:
+        """Why a ``/set`` does not reach the write gate: ``(error, keys, transaction)``, or None."""
         try:
-            body = json.loads(payload)
+            payload = json.loads(raw)
         except (TypeError, ValueError):
-            body = None
-        response: dict[str, Any] = {"status": "error", "error": READ_ONLY_ERROR}
-        if isinstance(body, dict) and "transaction" in body:
-            response["transaction"] = body["transaction"]
+            payload = None
+        if not isinstance(payload, dict):
+            return f"payload is not a JSON object; {NOTHING_SENT}", [], None
+        transaction = payload.get("transaction")
+        keys = sorted(k for k in payload if k != "transaction")
+        dev_id = next((d for d, known in self.names.items() if known == name), None)
+        if dev_id is None:
+            return f"unknown device; {NOTHING_SENT}", keys, transaction
+        reason = self.closed_reason()
+        if reason is not None:
+            return f"read-only bridge: {reason}; {NOTHING_SENT}", keys, transaction
+        if keys != [contract.OPEN_SET_KEY]:
+            return f"only {contract.OPEN_SET_KEY} can be written in this version; {NOTHING_SENT}", keys, transaction
+        if dev_id != self._designated():
+            return f"writes are open for the designated thermostat only; {NOTHING_SENT}", keys, transaction
+        return None
 
-        if levels[:2] == ["bridge", "request"] and len(levels) > 2:
-            action = levels[2:]
-            response["data"] = {}
-            response["error"] = REQUEST_ERROR
-            return [Message(self.topic("bridge", "response", *action), _json(response), False)]
-        if len(levels) == 2 and levels[1] == "set":
-            keys = sorted(k for k in body if k != "transaction") if isinstance(body, dict) else []
-            response["data"] = {"device": levels[0], "keys": keys}
-            if levels[0] not in self._by_name:
-                response["error"] = "unknown device; " + READ_ONLY_ERROR
-            return [Message(self.topic("bridge", "response", "device", "set"), _json(response), False)]
-        return []
+    def handle_set(self, name: str, raw: str) -> None:
+        refusal = self._refusal(name, raw)
+        if refusal is not None:
+            error, keys, transaction = refusal
+            log.info("command refused: %s", error.split(";")[0])
+            self._respond("device/set", data={"device": name, "keys": keys}, error=error, transaction=transaction)
+            return
+        self.gate.designated = self._designated()
+        log.warning("WRITE: %s asked for the designated thermostat", contract.OPEN_SET_KEY)
+        try:
+            super().handle_set(name, raw)
+        except Exception as err:  # the answer must come, whatever broke
+            log.error("write failed unexpectedly (%s)", type(err).__name__)
+            self._respond(
+                "device/set",
+                data={"device": name, "keys": [contract.OPEN_SET_KEY]},
+                error=f"internal error ({type(err).__name__}); read the device before trusting its state",
+                transaction=json.loads(raw).get("transaction"),
+            )
+        self.publish_info()
+
+    def _respond(self, action: str, **fields: Any) -> None:
+        if action == "device/set" and "results" in (fields.get("data") or {}):  # an answer of the gate
+            log.warning("WRITE answered: %s", "refused or not confirmed" if fields.get("error") else "confirmed")
+        super()._respond(action, **fields)
+
+    def handle_request(self, action: str, raw: str) -> None:
+        """Every ``bridge/request/<action>`` is refused in this version."""
+        try:
+            payload = json.loads(raw)
+        except (TypeError, ValueError):
+            payload = None
+        transaction = payload.get("transaction") if isinstance(payload, dict) else None
+        self._respond(action, error=REQUEST_ERROR, transaction=transaction)

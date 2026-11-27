@@ -13,5 +13,5 @@ if [ -z "${MQTT_HOST}" ] && bashio::services.available "mqtt"; then
     bashio::log.info "Using Home Assistant Mosquitto service at ${TUYAPILOT_MQTT_HOST}:${TUYAPILOT_MQTT_PORT}"
 fi
 
-bashio::log.info "Starting tuyapilot2mqtt bridge (read only)..."
+bashio::log.info "Starting tuyapilot2mqtt bridge..."
 exec tuyapilot2mqtt --options /data/options.json

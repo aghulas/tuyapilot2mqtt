@@ -11,6 +11,7 @@ from typing import Any
 
 CHANNELS = ("lan", "sharing", "developer")
 ENV_PREFIX = "TUYAPILOT_"
+REGIONS = ("eu", "us", "cn", "in", "sg")
 
 
 class ConfigError(ValueError):
@@ -34,6 +35,18 @@ class Settings:
     lan_version: str = "3.3"
     # Product assumed for the thermostats when the keys file carries no product id.
     lan_product_id: str = "fu1bfwza"
+    # Sharing channel (Smart Life account). The user code starts the QR-code login; the session
+    # the login gives is kept in a file of the bridge's own and never shared with another client.
+    sharing_user_code: str = field(default="", repr=False)
+    sharing_session_file: str = "/data/sharing_session.json"
+    # Developer channel (Tuya IoT platform project). Unavailable while the credentials are empty.
+    developer_access_id: str = field(default="", repr=False)
+    developer_access_secret: str = field(default="", repr=False)
+    developer_region: str = "eu"
+    # The single write of this version: the manual setpoint, on one designated thermostat
+    # (its friendly name or its Tuya device id). Closed by default.
+    writes_enabled: bool = False
+    write_device: str = ""
 
 
 _BOOL = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
@@ -83,3 +96,5 @@ def validate(s: Settings) -> None:
         raise ConfigError(f"option 'channels': unknown channel {unknown[0]!r}")
     if "lan" in s.channels and s.lan_version not in ("3.3", "3.4", "3.5"):
         raise ConfigError("option 'lan_version': 3.3, 3.4 or 3.5")
+    if s.developer_region not in REGIONS:
+        raise ConfigError(f"option 'developer_region': one of {', '.join(REGIONS)}")
