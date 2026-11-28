@@ -4,8 +4,6 @@
 
 MQTT contract **version 7**. Built on `pytuya-pilot-wire` 0.5.0, pinned by tag.
 
-- Add-on store icon and logo; the Home Assistant add-on linter runs in CI.
-
 - **Further settings, closed until proven.** `preset` `holiday`, `antifrost` (raw mode `hors`)
   and `eco`, `child_lock`, `window_detection`, `local_temperature_calibration` and
   `holiday_temperature` can be opened by name in the new option `write_settings`, on the
@@ -17,6 +15,23 @@ MQTT contract **version 7**. Built on `pytuya-pilot-wire` 0.5.0, pinned by tag.
   settings); `keys` lists the open `/set` keys.
 - The eco and frost-protection setpoints stay without a route: the sharing API does not declare
   them writable.
+
+## 0.4.0
+
+MQTT contract **version 6**. Built on `pytuya-pilot-wire` 0.4.0, pinned by tag.
+
+- **Weekly schedule, through the developer channel** (your Tuya developer project; it does not
+  open a Smart Life session). Read once an hour with the eco and frost setpoints, in the same
+  request, and published in each thermostat's state as `tuya.schedule` (with
+  `tuya.read.schedule`).
+- **`bridge/request/schedule/get`**: the schedule of any thermostat, read on demand.
+- **`bridge/request/schedule/set`**: one or more days, each described in full, on the designated
+  thermostats when writes are enabled. Read-modify-write of the four data points of each day,
+  keeping their headers; only the parts that change are sent, once; read back for 30 s. Counted
+  by the rate limit like a `/set`.
+- `bridge/info.writes.requests` lists the requests that can pass now (`["schedule/set"]`), and
+  `writes.requests_closed` says why not.
+- Add-on store icon and logo; the Home Assistant add-on linter runs in CI.
 
 ## 0.3.0
 

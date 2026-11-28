@@ -77,8 +77,13 @@ def _z(text: Any) -> Any:
     return text.replace("+00:00", "Z") if isinstance(text, str) else text
 
 
-def state(encoded: dict[str, Any], last_seen: float | None) -> dict[str, Any]:
-    """The state object of the contract (§3) from the library's ``dialect.encode_state``."""
+def state(
+    encoded: dict[str, Any], last_seen: float | None, schedule: tuple[dict[str, Any], float] | None = None
+) -> dict[str, Any]:
+    """The state object of the contract (§3) from the library's ``dialect.encode_state``.
+
+    ``schedule`` is the weekly schedule last read through the developer channel and its time.
+    """
     out: dict[str, Any] = {}
     extension = dict(encoded.get("tuya") or {})
     for name, value in encoded.items():
@@ -92,6 +97,9 @@ def state(encoded: dict[str, Any], last_seen: float | None) -> dict[str, Any]:
     }
     if last_seen is not None:
         out["last_seen"] = iso(last_seen)
+    if schedule is not None:
+        extension["schedule"] = schedule[0]
+        read["schedule"] = {"channel": "developer", "at": iso(schedule[1])}
     out["tuya"] = extension | {"read": read}
     return out
 

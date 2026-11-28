@@ -1,8 +1,8 @@
 # MQTT contract
 
-Contract version: **7** (2026-11-28). Published by `tuyapilot2mqtt` 0.5.0 and later: sharing API and LAN
-channels, **read only unless the owner opens the writes of this version** (§4) on the thermostats
-it designates. The same
+Contract version: **7** (2026-11-28). Published by `tuyapilot2mqtt` 0.5.0 and later: sharing API, LAN
+and developer API channels, **read only unless the owner opens the writes of this version** (§4,
+§5) on the thermostats it designates. The same
 number is in `bridge/info.contract`; it is incremented at every change of this document that a
 reader of the topics can observe. History: [§7](#7-versions).
 
@@ -46,7 +46,8 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
   "read_only": true,
   "writes": {"enabled": false, "keys": ["current_heating_setpoint", "preset"],
              "presets": ["manual", "program"], "settings": [], "devices": [],
-             "device": null, "closed": "writes are disabled in the options"},
+             "device": null, "closed": "writes are disabled in the options",
+             "requests": [], "requests_closed": "writes are disabled in the options"},
   "poll_interval": 60,
   "channels": {
     "sharing": {"enabled": true, "state": "online", "last_ok": "2026-11-27T14:08:26Z"},
@@ -74,6 +75,11 @@ appended to a repeated name; `bridge` is reserved). It can contain spaces, as in
   (`"preset"` added for a preset setting; `"device": null` and `"closed"` when the trial
   thermostat is not designated). **A reader must not offer a control for a trial**: it is the
   owner's test, run by hand.
+- `writes.requests` lists the write requests of §5 that can pass now, on the thermostats of
+  `writes.devices`: `["schedule/set"]` when writes are enabled, a designated thermostat is among
+  the devices and the developer channel is `online`; empty otherwise, with the reason in
+  `writes.requests_closed`. It does not depend on the sharing channel: `read_only` is about the
+  `/set` commands of §4. A reader that offers a schedule write follows this list.
 - A channel's `state`, when it is `enabled`:
 
   | State | Meaning |
@@ -153,6 +159,7 @@ property it returns, as in versions 1 and 2. `tuya.read` says, for each value, w
 | `voltage` / `current` | float, V / A | DP 101 / DP 102; published **only while heating** | LAN |
 | `energy` | float, kWh, cumulative | DP 107 `energy_all` | LAN |
 | `eco_temperature` / `antifrost_temperature` | float, °C | DP 117 / DP 116 | developer API, else LAN |
+| `tuya.schedule` | weekly schedule, same shape as §5 | DP 125–152 `week_program_18_<day>_<part>` | developer API |
 | `last_seen` | ISO 8601 UTC, `2026-11-27T14:08:26Z` | time of the last reading of the device, any channel | bridge |
 
 Announced, **not published**: `temperature_sensibility` (DP 103), `power` from DP 11 `work_power`,
@@ -176,7 +183,12 @@ Rules:
   raw value is always in `tuya.mode`.
 - In `program` preset the target setpoint is in no data point. Whether the bridge publishes one
   derived from the weekly schedule is open (scope, question 6); `current_heating_setpoint` stays
-  the manual-mode setpoint.
+  the manual-mode setpoint. The schedule itself is published (`tuya.schedule`): a reader can
+  derive the slot running now from it.
+- `tuya.schedule` is read through the developer channel **once an hour**, in the same request as
+  the eco and frost setpoints, and after every `schedule/get` and `schedule/set` (§5). A change
+  made in the Tuya app shows within the hour. It holds the days that were read in full; it is
+  absent until a first reading and never replaced by an unreadable one.
 
 Extension object `tuya` in the state, for what has no Zigbee2MQTT equivalent:
 
@@ -191,8 +203,9 @@ Extension object `tuya` in the state, for what has no Zigbee2MQTT equivalent:
 ```
 
 - `mode`: the raw DP 2 value, when read.
+- `schedule`: the weekly schedule (above), when read.
 - `read`: for each published property, the channel its value came from (`sharing`, `lan` or
-  `developer`) and the time it was read.
+  `developer`) and the time it was read; `read.schedule` for `schedule`.
 
 ## 4. Commands (`<prefix>/<friendly_name>/set`)
 
@@ -318,21 +331,55 @@ Routes of the commands:
 
 ## 5. Requests (`<prefix>/bridge/request/<action>`)
 
-**In this version** every request, `schedule/get` included, is answered on
-`<prefix>/bridge/response/<action>` by
-`{"status": "error", "error": "request not available in this version; nothing was sent to the device", "data": {}}`,
-with the request's `transaction` echoed. Target for the later milestones:
+Two requests, on the **weekly schedule**, through the developer channel. Every request is answered
+on `<prefix>/bridge/response/<action>` (not retained), with the request's `transaction` echoed;
+`data.device` repeats the request's `device`.
 
-| Action | Request | Response `data` |
-|---|---|---|
-| `schedule/get` | `{"device": "<friendly_name>"}` | `{"monday": [{"time": "00:00", "temperature": 16.0}, …], …}` |
-| `schedule/set` | `{"device": "<friendly_name>", "days": {"monday": [ … ]}}` | the schedule read back after the write |
+| Action | Request | Open | Response `data` |
+|---|---|---|---|
+| `schedule/get` | `{"device": "<friendly_name>"}` | every thermostat, while the developer channel is `online` | `{"device": …, "schedule": {"monday": [ … ], …}}` |
+| `schedule/set` | `{"device": "<friendly_name>", "days": {"saturday": [ … ]}}` | the thermostats of `writes.devices`, while `writes.requests` holds `schedule/set` (§1.1) | `{"device": …, "days": [ … ], "written": <parts sent>, "confirmed": true, "schedule": { … }}` |
 
-A day is described in full: first transition at 00:00, times on a 15-minute step, temperatures on
-a 0.5 °C step. Days not given are left untouched. The write is read-modify-write on the device's
-28 schedule data points (codec in `pytuya-pilot-wire`). Route: developer API, proven on one
-thermostat (2026-11-14); it needs the user's developer project and an active subscription, and
-`bridge/info` says whether that channel is usable.
+A **schedule** is an object of days, `monday` to `sunday`; a **day** is its list of setpoint
+changes in time order:
+
+```json
+"saturday": [{"time": "00:00", "temperature": 7.0},
+             {"time": "07:30", "temperature": 19.0},
+             {"time": "17:00", "temperature": 7.0}]
+```
+
+- A day is described **in full**: the first change is at `00:00`, times are `HH:MM` on a
+  15-minute step and distinct, temperatures are °C on a 0.5 °C step, **5 to 30 °C**. A day of
+  the same temperature all day is one change at `00:00`.
+- `schedule/get` reads the device's 28 data points and answers the days read in full; a day
+  with a missing part is left out and the answer is then `"status": "error"` ("some days could
+  not be read in full"), with what was read.
+- `schedule/set` takes **one or more days**; the days not given are left untouched. It is
+  read-modify-write: the bridge reads the device's data points, encodes each day given keeping
+  the 12-byte header each part carries, and sends **once** only the parts that differ (`written`
+  is their number; `0` when the device already holds the days asked). It then reads the
+  schedule back, every 5 s for 30 s at most. `"status": "ok"` means **written and read back**;
+  `confirmed: false` (with `"status": "error"`) means the read-back still differs, and
+  `schedule` is what was read. The response comes within about 40 s; a reader should allow 60 s.
+- A `schedule/set` counts in the rate limit of §4 (one write every 10 s and 30 an hour per
+  thermostat), like a `/set`.
+- After both requests the state object is republished when the schedule read differs from the
+  one held (`tuya.schedule`, §3).
+
+Refused before anything is sent, `"status": "error"` and `error` ending in
+`nothing was sent to the device`: an unknown action, a payload that is not a JSON object, an
+unknown device; for `schedule/get` the developer channel not `online`
+(`"schedule unavailable: …"`); for `schedule/set` the reason of `writes.requests_closed`
+(`"schedule read only: …"`), a thermostat that is not designated, `days` missing or empty, an
+unknown day, a write over the rate limit. A day that is not described as above is refused by the
+library's gate (`"schedule: …"`), with nothing sent.
+
+Route: developer API (device shadow properties), the only one that returns these data points;
+the LAN does not return them and the sharing API does not declare them. Read on six thermostats
+(2026-11-03, 2026-11-28); written read-modify-write and restored on one thermostat
+(2026-11-14). The developer API signs in with the developer project's credentials, not as a
+Smart Life client: it does not touch the account's session held by the sharing channel.
 
 Rooms are not part of this contract: they belong to the Companion.
 
@@ -353,4 +400,5 @@ families (`occupied_heating_setpoint` there, `current_heating_setpoint` here), a
 | 3 | 2026-11-27 | 0.2.0 | Sharing API channel (QR-code login) and first write. Added: `bridge/info.writes`; channel states `unauthenticated`, `login_required`, `waiting_for_scan`, `login_expired`, `unavailable`, and `last_ok`; `window_detection`, `child_lock`, `local_temperature_calibration` published; `preset: "antifrost"`; `fault` names `e1` / `e2` / `e3`; `product_id_source: "account"`; `/set` accepts `current_heating_setpoint` for one designated thermostat when `read_only` is `false`, with a response to every `/set` (`data.results`, 30 °C ceiling). Changed: each property comes from the channel proven for it when the sharing API is connected (the LAN alone otherwise); availability is "a reading younger than 10 minutes, and online for the account" (was: three passes without an answer); `bridge/info` is republished on change only and its channel entries lose `devices` / `devices_answering` and the state `unsupported`; unsupported devices are no longer listed; `tuya.gateway` can be absent; refusal texts. Still announced, not published: `temperature_sensibility`, `energy_today`, `energy_yesterday`, `power` from DP 11 |
 | 4 | 2026-11-27 | 0.2.2 | `current_heating_setpoint` is accepted only while the designated thermostat is in `manual` mode; in any other mode, or while the mode is unknown, the command is refused with nothing sent and the mode named in `error`. Added: the reason (§4, "Why `manual` only"): in `program` the running schedule slot overwrites a written setpoint |
 | 5 | 2026-11-27 | 0.3.0 | Added: `preset` is writable, `manual` and `program` only (`eco`, `holiday`, `antifrost` refused, nothing sent); several designated thermostats, `bridge/info.writes.devices`; `writes.keys` is `["current_heating_setpoint", "preset"]`; a rate limit per thermostat (one write every 10 s, 30 an hour), refused with the delay in `error`. Changed: one key per command (two keys are refused); `writes.device` is the first of `devices`, kept for readers of version 4; refusal texts ("designated thermostats only", "one key per command") |
+| 6 | 2026-11-28 | 0.4.0 | Weekly schedule through the developer channel. Added: `bridge/request/schedule/get` (every thermostat) and `schedule/set` (designated thermostats, one or more days in full, read-modify-write, read back; counted by the rate limit), answered with `data.device` and `data.schedule`; `tuya.schedule` and `tuya.read.schedule` in the state, read hourly with the settings; `bridge/info.writes.requests` and `writes.requests_closed`. Changed: a request is no longer always refused; refusal texts of §5 |
 | 7 | 2026-11-28 | 0.5.0 | Added: further settings (§4.1), each a closed candidate until its trial, opened by name in the options once proven: `preset` `holiday`, `antifrost`, `eco`, `child_lock`, `window_detection`, `local_temperature_calibration`, `holiday_temperature`; `bridge/info.writes.presets`, `writes.settings`, `writes.refused`, `writes.trial`. Changed: `writes.keys` lists the open keys (unchanged while no setting is open); refusal texts for a preset or key that is not open (`"preset: 'eco' is not open (open: manual, program)"`) |
