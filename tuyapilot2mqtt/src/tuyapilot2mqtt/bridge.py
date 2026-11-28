@@ -7,11 +7,14 @@ repository says beyond the library's draft-0 codec, and the policy of this versi
 - ``bridge/info``, descriptors and state objects in the shape of ``docs/mqtt-contract.md``;
 - the thermostats of the local keys file when the sharing channel has no session yet, and the LAN
   readings standing in for the state while the sharing channel is not connected;
-- **two writes, one key per command**, on the thermostats the owner designated
-  (``write_devices``), when the owner enabled writes and the sharing channel is connected:
-  ``preset`` to ``manual`` or ``program``, and ``current_heating_setpoint`` while the thermostat
-  is in ``manual`` mode. Everything else on ``/set`` is refused before the library sees it, and
-  refused a second time by the gate (which reads the device again just before sending);
+- **writes, one key per command**, on the thermostats the owner designated (``write_devices``),
+  when the owner enabled writes and the sharing channel is connected: ``preset`` to ``manual`` or
+  ``program``, and ``current_heating_setpoint`` while the thermostat is in ``manual`` mode; then
+  each further setting the owner names in ``write_settings`` (``contract.SETTINGS``) once the
+  library proves its route; and, for a supervised trial, one candidate setting on one designated
+  thermostat (``trial_setting``, ``trial_device``). Everything else on ``/set`` is refused before
+  the library sees it, and refused a second time by the gate (which reads the device again just
+  before sending);
 - the **weekly schedule** through the developer channel: ``bridge/request/schedule/get`` for every
   thermostat, ``bridge/request/schedule/set`` for the designated ones when writes are enabled
   (read-modify-write of the 28 data points by the library's gate, read back); the schedule read
@@ -37,6 +40,7 @@ from pytuya_pilot_wire.bridge import BridgeConfig
 from pytuya_pilot_wire.errors import PilotWireError, WriteRefused
 from pytuya_pilot_wire.gate import PlannedWrite, ScheduleResult, SharingWriter, WriteGate, setpoint_mode_refusal
 from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, DeviceState, Reading
+from pytuya_pilot_wire.router import RouteState, operation_of
 
 from . import CONTRACT_VERSION, __version__, contract
 from .config import CHANNELS, Settings
@@ -49,8 +53,10 @@ REQUESTS = ("schedule/get", "schedule/set")
 
 # Library channel states -> contract states (§1.1).
 _STATES = {"idle": "starting", "ok": "online", "error": "offline", "unauthenticated": "unauthenticated"}
-# The library's model keys behind the open `/set` keys.
-_MODEL_KEYS = {"setpoint": contract.SETPOINT_KEY, "mode": contract.PRESET_KEY}
+# The library's model keys behind the `/set` keys this version can open.
+_SET_KEYS = {"setpoint": contract.SETPOINT_KEY, "mode": contract.PRESET_KEY} | {
+    setting.model_key: setting.key for setting in contract.SETTINGS.values()
+}
 
 # Rate limit per thermostat, on the commands actually sent.
 WRITE_MIN_INTERVAL = 10.0
@@ -112,15 +118,17 @@ class _Developer:
 
 
 class TrialGate(WriteGate):
-    """The library's write gate, narrowed to the writes this version opens.
+    """The library's write gate, narrowed to the writes the options open.
 
-    The manual setpoint and the mode (``manual`` or ``program``) of a designated thermostat pass on
-    to the library's checks (route, the device's own bounds, step and modes, ceiling, fresh read,
-    setpoint refused in any mode but ``manual``, one send, read-back). Any other key, any other
-    device and any other mode stop here; the weekly schedule passes for a designated thermostat.
+    A write the bridge opens for a designated thermostat passes on to the library's checks
+    (route, the device's own bounds, step and modes, ceiling, fresh read, setpoint refused in any
+    mode but ``manual``, one send, read-back). Any other key, device or mode stops here; the
+    weekly schedule passes for a designated thermostat. ``allows`` is the bridge's own rule:
+    ``(dev_id, key, preset)`` to a refusal, or ``None``.
     """
 
     designated: frozenset[str] = frozenset()  # Tuya device ids of the designated thermostats
+    allows: Callable[[str, str, str | None], str | None] = staticmethod(lambda _d, _k, _p: "closed")
 
     def __init__(
         self,
@@ -140,12 +148,14 @@ class TrialGate(WriteGate):
         super().replace(sharing=self._logged(sharing), developer=developer)
 
     def plan(self, device: Device, spec: DeviceSpec | None, key: str, value: Any) -> PlannedWrite:
-        if key not in _MODEL_KEYS:
-            raise WriteRefused(f"only {' or '.join(contract.OPEN_SET_KEYS)} can be written in this version")
+        if key not in _SET_KEYS:
+            raise WriteRefused(f"{key}: cannot be written in this version")
         if device.dev_id not in self.designated:
             raise WriteRefused("writes are open for the designated thermostats only")
-        if key == "mode" and value not in contract.WRITABLE_PRESETS:
-            raise WriteRefused(f"preset: only {' and '.join(contract.WRITABLE_PRESETS)} can be written")
+        preset = dialect.PRESETS.get(value) if key == "mode" and isinstance(value, str) else None
+        refusal = self.allows(device.dev_id, _SET_KEYS[key], preset)
+        if refusal is not None:
+            raise WriteRefused(refusal)
         return super().plan(device, spec, key, value)
 
     def write_schedule(self, device: Device, days: Mapping[str, Any]) -> ScheduleResult:
@@ -192,6 +202,7 @@ class Bridge(LibraryBridge):
             on_send=self._count_send,
             **(gate_options or {}),
         )
+        self.gate.allows = self._gate_allows
         self._local = local
         # Channels enabled in the options that could not be built, with the reason (no secret in it).
         self._unavailable = dict(unavailable or {})
@@ -212,6 +223,66 @@ class Bridge(LibraryBridge):
         wanted = set(self.settings.write_devices)
         found = [dev_id for dev_id, name in self.names.items() if dev_id in wanted or name in wanted]
         return sorted(found, key=lambda dev_id: self.names[dev_id])
+
+    # -- what the options open ---------------------------------------------------------------
+
+    def settings_state(self) -> tuple[list[contract.Setting], dict[str, str]]:
+        """The settings of ``write_settings`` that open (proven by the library), and why the
+        others do not."""
+        opened: list[contract.Setting] = []
+        refused: dict[str, str] = {}
+        for name in self.settings.write_settings:
+            setting = contract.SETTINGS[name]
+            state = self.router.state(dps.PRODUCT_FP_THERMOSTAT, operation_of(setting.model_key), setting.mode)
+            if state is RouteState.PROVEN:
+                opened.append(setting)
+            else:
+                refused[name] = f"{state.value} route: opens once the library records its supervised trial"
+        return opened, refused
+
+    def trial(self) -> tuple[contract.Setting, str | None, str | None]:
+        """The trial of the options: its setting, the device id it opens on, and why it does not.
+
+        Only meaningful when ``trial_setting`` is set. The trial device must be designated.
+        """
+        setting = contract.SETTINGS[self.settings.trial_setting]
+        wanted = self.settings.trial_device
+        dev_id = next((d for d in self._designated() if wanted in (d, self.names[d])), None)
+        if dev_id is None:
+            return setting, None, "the trial thermostat is not among the designated thermostats"
+        return setting, dev_id, None
+
+    def _sync_trial(self) -> None:
+        """Designate the trial to the library's router (nothing when no trial is set)."""
+        trials: dict[str, str] = {}
+        if self.settings.trial_setting:
+            setting, dev_id, _ = self.trial()
+            if dev_id is not None:
+                trials[setting.write_name] = dev_id
+        self.router.trials = trials
+
+    def open_keys(self) -> tuple[list[str], list[str]]:
+        """The `/set` keys and the presets open on every designated thermostat."""
+        opened, _ = self.settings_state()
+        keys = list(contract.OPEN_SET_KEYS) + [s.key for s in opened if s.key not in contract.OPEN_SET_KEYS]
+        presets = list(contract.WRITABLE_PRESETS) + [s.preset for s in opened if s.preset]
+        return list(dict.fromkeys(keys)), presets
+
+    def _allows(self, dev_id: str, key: str, preset: str | None, value: Any) -> str | None:
+        """Why ``key`` (``preset`` for a mode) is not open on ``dev_id``, or ``None``."""
+        keys, presets = self.open_keys()
+        if self.settings.trial_setting:
+            setting, trial_dev, _ = self.trial()
+            if trial_dev == dev_id and setting.key == key and (key != contract.PRESET_KEY or setting.preset == preset):
+                return None
+        if key not in keys:
+            return f"{key} is not open (open: {', '.join(keys)})"
+        if key == contract.PRESET_KEY and preset not in presets:
+            return f"preset: {value!r} is not open (open: {', '.join(presets)})"
+        return None
+
+    def _gate_allows(self, dev_id: str, key: str, preset: str | None) -> str | None:
+        return self._allows(dev_id, key, preset, preset)
 
     def closed_reason(self) -> str | None:
         """Why no write can pass now, or ``None`` when the writes of this version are open."""
@@ -316,15 +387,31 @@ class Bridge(LibraryBridge):
         reason = self.closed_reason()
         designated = self._designated()
         self.gate.designated = frozenset(designated)
+        self._sync_trial()
         names = [self.names[dev_id] for dev_id in designated]
+        keys, presets = self.open_keys()
+        opened, refused = self.settings_state()
         schedule_reason = self.schedule_closed_reason()
         writes: dict[str, Any] = {
             "enabled": self.settings.writes_enabled,
-            "keys": list(contract.OPEN_SET_KEYS),
+            "keys": keys,
+            "presets": presets,
+            "settings": [s.name for s in opened],
             "devices": names,
             "device": names[0] if names else None,  # contract 4 and earlier; the first of `devices`
             "requests": [] if schedule_reason else ["schedule/set"],
         }
+        if refused:
+            writes["refused"] = refused
+        if self.settings.trial_setting:
+            setting, trial_dev, why = self.trial()
+            trial: dict[str, Any] = {"setting": setting.name, "key": setting.key}
+            if setting.preset:
+                trial["preset"] = setting.preset
+            trial["device"] = self.names[trial_dev] if trial_dev else None
+            if why:
+                trial["closed"] = why
+            writes["trial"] = trial
         if reason:
             writes["closed"] = reason
         if schedule_reason:
@@ -348,7 +435,7 @@ class Bridge(LibraryBridge):
                 self._open = reason is None
                 log.warning(
                     "the writes (%s) are now %s",
-                    ", ".join(contract.OPEN_SET_KEYS),
+                    ", ".join(keys),
                     f"OPEN on {len(names)} thermostat(s)" if self._open else "closed",
                 )
             self._info = signature
@@ -484,16 +571,20 @@ class Bridge(LibraryBridge):
         reason = self.closed_reason()
         if reason is not None:
             return f"read-only bridge: {reason}; {NOTHING_SENT}", keys, transaction
-        if len(keys) != 1 or keys[0] not in contract.OPEN_SET_KEYS:
-            allowed = " or ".join(contract.OPEN_SET_KEYS)
+        open_keys, _ = self.open_keys()
+        if self.settings.trial_setting:
+            open_keys = list(dict.fromkeys([*open_keys, contract.SETTINGS[self.settings.trial_setting].key]))
+        if len(keys) != 1 or keys[0] not in open_keys:
+            allowed = " or ".join(open_keys)
             return f"one key per command, {allowed} only, in this version; {NOTHING_SENT}", keys, transaction
         if dev_id not in self._designated():
             return f"writes are open for the designated thermostats only; {NOTHING_SENT}", keys, transaction
-        if keys[0] == contract.PRESET_KEY:
-            value = payload[contract.PRESET_KEY]
-            if value not in contract.WRITABLE_PRESETS:
-                allowed = " and ".join(repr(p) for p in contract.WRITABLE_PRESETS)
-                return f"preset: only {allowed} can be written, not {value!r}; {NOTHING_SENT}", keys, transaction
+        key, value = keys[0], payload[keys[0]]
+        preset = value if key == contract.PRESET_KEY and isinstance(value, str) else None
+        refusal = self._allows(dev_id, key, preset, value)
+        if refusal is not None:
+            return f"{refusal}; {NOTHING_SENT}", keys, transaction
+        if key != contract.SETPOINT_KEY:
             return self._rate_check(dev_id, keys, transaction)
         held = self.states.get(dev_id)
         mode = held.values.get("mode") if held is not None else None
@@ -517,6 +608,7 @@ class Bridge(LibraryBridge):
             self._respond("device/set", data={"device": name, "keys": keys}, error=error, transaction=transaction)
             return
         self.gate.designated = frozenset(self._designated())
+        self._sync_trial()
         key = next(k for k in json.loads(raw) if k != "transaction")
         log.warning("WRITE: %s asked for a designated thermostat", key)
         try:

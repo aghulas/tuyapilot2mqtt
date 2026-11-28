@@ -1,5 +1,21 @@
 # Changelog
 
+## 0.5.0
+
+MQTT contract **version 7**. Built on `pytuya-pilot-wire` 0.5.0, pinned by tag.
+
+- **Further settings, closed until proven.** `preset` `holiday`, `antifrost` (raw mode `hors`)
+  and `eco`, `child_lock`, `window_detection`, `local_temperature_calibration` and
+  `holiday_temperature` can be opened by name in the new option `write_settings`, on the
+  thermostats of `write_devices`, **once the library marks their route proven** after a
+  supervised trial. Until then they stay closed and `bridge/info.writes.refused` says why.
+- **Trials.** `trial_setting` and `trial_device` open one candidate setting on one designated
+  thermostat, for a supervised trial; `bridge/info.writes.trial` says what is open and where.
+- `bridge/info.writes` gains `presets` (the open preset values) and `settings` (the open
+  settings); `keys` lists the open `/set` keys.
+- The eco and frost-protection setpoints stay without a route: the sharing API does not declare
+  them writable.
+
 ## 0.4.0
 
 MQTT contract **version 6**. Built on `pytuya-pilot-wire` 0.4.0, pinned by tag.

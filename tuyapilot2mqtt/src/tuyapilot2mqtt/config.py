@@ -10,6 +10,16 @@ from pathlib import Path
 from typing import Any
 
 CHANNELS = ("lan", "sharing", "developer")
+# The names of contract.SETTINGS (kept here so that the settings load without the library).
+SETTING_NAMES = (
+    "preset_holiday",
+    "preset_antifrost",
+    "preset_eco",
+    "child_lock",
+    "window_detection",
+    "local_temperature_calibration",
+    "holiday_temperature",
+)
 ENV_PREFIX = "TUYAPILOT_"
 REGIONS = ("eu", "us", "cn", "in", "sg")
 
@@ -47,6 +57,13 @@ class Settings:
     # designated thermostats only: friendly names or Tuya device ids. Closed by default.
     writes_enabled: bool = False
     write_devices: tuple[str, ...] = ()
+    # Further writes, opened by name once the library proves their route (``contract.SETTINGS``):
+    # preset_holiday, preset_antifrost, preset_eco, child_lock, window_detection,
+    # local_temperature_calibration, holiday_temperature.
+    write_settings: tuple[str, ...] = ()
+    # A supervised trial: one candidate setting, opened on one designated thermostat only.
+    trial_setting: str = ""
+    trial_device: str = ""
 
 
 _BOOL = {"1": True, "true": True, "yes": True, "on": True, "0": False, "false": False, "no": False, "off": False}
@@ -57,7 +74,7 @@ def _coerce(name: str, kind: Any, raw: Any) -> Any:
         if name == "channels":
             items = raw.replace(",", " ").split() if isinstance(raw, str) else list(raw)
             return tuple(str(i) for i in items)
-        if name == "write_devices":  # names can hold spaces: a string is split on commas only
+        if name in ("write_devices", "write_settings"):  # names can hold spaces: split on commas
             items = raw.split(",") if isinstance(raw, str) else list(raw)
             return tuple(dict.fromkeys(str(i).strip() for i in items if str(i).strip()))
         if kind == "bool":
@@ -99,5 +116,12 @@ def validate(s: Settings) -> None:
         raise ConfigError(f"option 'channels': unknown channel {unknown[0]!r}")
     if "lan" in s.channels and s.lan_version not in ("3.3", "3.4", "3.5"):
         raise ConfigError("option 'lan_version': 3.3, 3.4 or 3.5")
+    unknown = [name for name in s.write_settings if name not in SETTING_NAMES]
+    if unknown:
+        raise ConfigError(f"option 'write_settings': unknown setting {unknown[0]!r}")
+    if s.trial_setting and s.trial_setting not in SETTING_NAMES:
+        raise ConfigError(f"option 'trial_setting': unknown setting {s.trial_setting!r}")
+    if bool(s.trial_setting) != bool(s.trial_device):
+        raise ConfigError("options 'trial_setting' and 'trial_device' go together")
     if s.developer_region not in REGIONS:
         raise ConfigError(f"option 'developer_region': one of {', '.join(REGIONS)}")

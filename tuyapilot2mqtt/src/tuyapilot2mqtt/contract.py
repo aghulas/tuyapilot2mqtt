@@ -9,6 +9,7 @@ names, the descriptor's identity fields, timestamps. No Tuya logic.
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
@@ -23,11 +24,46 @@ DESCRIPTION = "Pilot-wire thermostat"
 _PROPERTIES = {"frost_protection_temperature": "antifrost_temperature"}
 _PRESETS = {"schedule": "program", "frost_protection": "antifrost"}
 
-# The `/set` keys this version of the bridge can open, one per command, and the presets it writes.
+# The `/set` keys open whenever the writes are, one per command, and the presets they write.
 SETPOINT_KEY = "current_heating_setpoint"
 PRESET_KEY = "preset"
 OPEN_SET_KEYS = (SETPOINT_KEY, PRESET_KEY)
 WRITABLE_PRESETS = ("manual", "program")
+
+
+@dataclass(frozen=True)
+class Setting:
+    """A write the owner opens by name in the options (``write_settings``), after its trial.
+
+    ``key`` is the `/set` key; ``preset`` the preset value for a setting that is a mode;
+    ``model_key`` the library's model key and ``mode`` the raw Tuya mode behind the preset.
+    """
+
+    name: str
+    key: str
+    model_key: str
+    preset: str | None = None
+    mode: str | None = None
+
+    @property
+    def write_name(self) -> str:
+        """The library's name of this write (``router.write_name``), for a trial designation."""
+        return f"mode:{self.mode}" if self.mode else self.model_key
+
+
+# Every setting this version can open, each a closed candidate until the library proves its route.
+SETTINGS: dict[str, Setting] = {
+    s.name: s
+    for s in (
+        Setting("preset_holiday", PRESET_KEY, "mode", "holiday", "holiday"),
+        Setting("preset_antifrost", PRESET_KEY, "mode", "antifrost", "hors"),
+        Setting("preset_eco", PRESET_KEY, "mode", "eco", "eco"),
+        Setting("child_lock", "child_lock", "child_lock"),
+        Setting("window_detection", "window_detection", "window_detection"),
+        Setting("local_temperature_calibration", "local_temperature_calibration", "temperature_correction"),
+        Setting("holiday_temperature", "holiday_temperature", "holiday_setpoint"),
+    )
+}
 
 _EUI64 = re.compile(r"[0-9a-fA-F]{16}")
 
