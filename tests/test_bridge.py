@@ -195,11 +195,12 @@ def test_lan_alone_publishes_every_property_it_read() -> None:
 
     assert transport.last("Room A/availability") == {"state": "online"}
     info = transport.last("bridge/info")
-    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 5
+    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 6
     assert info["read_only"] is True
     assert info["writes"] == {
         "enabled": False, "keys": ["current_heating_setpoint", "preset"], "devices": [], "device": None,
-        "closed": "writes are disabled in the options",
+        "closed": "writes are disabled in the options", "requests": [],
+        "requests_closed": "writes are disabled in the options",
     }  # fmt: skip
     assert info["channels"]["lan"]["state"] == "online"
     assert info["channels"]["sharing"] == info["channels"]["developer"] == {"enabled": False}
@@ -333,6 +334,7 @@ def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() ->
     info = transport.last("bridge/info")
     assert info["read_only"] is False and info["writes"] == {
         "enabled": True, "keys": ["current_heating_setpoint", "preset"], "devices": ["Room A"], "device": "Room A",
+        "requests": [], "requests_closed": "the developer channel is not enabled",
     }  # fmt: skip
     clock.now += 5
     set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "abc"})
@@ -495,14 +497,18 @@ def test_the_write_closes_when_the_sharing_channel_fails() -> None:
     assert info["read_only"] is True and info["writes"]["closed"] == "the sharing channel is not connected"
 
 
-def test_every_request_is_refused() -> None:
+def test_requests_without_the_developer_channel_are_refused() -> None:
     bridge, transport, _, sharing = make(**OPEN)
-    for action in ("schedule/get", "schedule/set", "anything"):
+    for action, error in (
+        ("schedule/get", "schedule unavailable: the developer channel is not enabled"),
+        ("schedule/set", "schedule read only: the developer channel is not enabled"),
+        ("anything", "unknown request 'anything'"),
+    ):
         bridge.handle_message(f"tuyapilot2mqtt/bridge/request/{action}", '{"device": "Room A", "transaction": 7}')
         assert transport.last(f"bridge/response/{action}") == {
             "status": "error",
-            "data": {},
-            "error": "request not available in this version; nothing was sent to the device",
+            "data": {"device": "Room A"},
+            "error": f"{error}; nothing was sent to the device",
             "transaction": 7,
         }
     bridge.handle_message("tuyapilot2mqtt/bridge/request/schedule/get", "garbage")
@@ -521,8 +527,8 @@ def test_the_gate_itself_refuses_what_the_bridge_filters() -> None:
         gate.plan(b, sharing.spec(B), "setpoint", 20.0)
     with pytest.raises(WriteRefused, match="only manual and program"):
         gate.plan(a, sharing.spec(A), "mode", "eco")
-    with pytest.raises(WriteRefused, match="weekly schedule"):
-        gate.write_schedule(a, {"monday": []})
+    with pytest.raises(WriteRefused, match="designated thermostats only"):
+        gate.write_schedule(b, {"monday": []})
     gate.designated = frozenset()
     with pytest.raises(WriteRefused, match="designated thermostats only"):
         gate.plan(a, sharing.spec(A), "setpoint", 20.0)
@@ -672,9 +678,7 @@ def test_login_shows_a_code_then_returns_the_session() -> None:
 def test_login_renews_the_code_then_gives_up() -> None:
     clock = Clock()
     shown: list[str] = []
-    login = session.Login(
-        "code", request=lambda code: "qr", poll=lambda qr, code: None, show=shown.append, clock=clock
-    )
+    login = session.Login("code", request=lambda code: "qr", poll=lambda qr, code: None, show=shown.append, clock=clock)
     for _ in range(session.MAX_QR_CODES + 3):
         login.tick()
         clock.now += session.QR_LIFETIME
