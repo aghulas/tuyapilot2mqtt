@@ -1,5 +1,17 @@
 # Changelog
 
+## 0.5.1
+
+MQTT contract version 7, unchanged. Built on `pytuya-pilot-wire` 0.5.1, pinned by tag.
+
+- **Six settings proven** by supervised trials through this bridge (records in
+  `ha-tuya-pilot-wire/docs/validation/`): `preset_holiday`, `preset_eco`, `child_lock`,
+  `window_detection`, `local_temperature_calibration`, `holiday_temperature`. Named in
+  `write_settings`, they now open on every designated thermostat.
+- `preset_antifrost` has no route: the sharing API refused the raw value `hors`. Named in
+  `write_settings`, it is listed in `writes.refused` with
+  `"no route: the library refuses this write (see its route table)"`.
+
 ## 0.5.0
 
 MQTT contract **version 7**. Built on `pytuya-pilot-wire` 0.5.0, pinned by tag.

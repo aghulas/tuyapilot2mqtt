@@ -237,7 +237,11 @@ class Bridge(LibraryBridge):
             if state is RouteState.PROVEN:
                 opened.append(setting)
             else:
-                refused[name] = f"{state.value} route: opens once the library records its supervised trial"
+                refused[name] = (
+                    "candidate route: opens once the library records its supervised trial"
+                    if state is RouteState.CANDIDATE
+                    else "no route: the library refuses this write (see its route table)"
+                )
         return opened, refused
 
     def trial(self) -> tuple[contract.Setting, str | None, str | None]:

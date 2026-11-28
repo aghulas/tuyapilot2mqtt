@@ -6,7 +6,7 @@ this version (preset ``manual`` / ``program`` and the manual setpoint, on the de
 thermostats) in the options.
 """
 
-__version__ = "0.5.0"
+__version__ = "0.5.1"
 
 # Version of docs/mqtt-contract.md this code publishes (``bridge/info.contract``).
 CONTRACT_VERSION = 7
