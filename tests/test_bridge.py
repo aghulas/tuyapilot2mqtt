@@ -8,6 +8,7 @@ import stat
 from typing import Any
 
 import pytest
+from pytuya_pilot_wire import dps, router
 from pytuya_pilot_wire.errors import ChannelError, WriteRefused
 from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, Reading
 
@@ -90,6 +91,10 @@ class Sharing:
                 {"code": "temp_set", "type": "Integer", "values": {"min": 50, "max": 400, "step": 5}},
                 {"code": "switch", "type": "Boolean", "values": {}},
                 {"code": "mode", "type": "Enum", "values": {"range": ["eco", "holiday", "program", "manual"]}},
+                {"code": "child_lock", "type": "Boolean", "values": {}},
+                {"code": "window_check", "type": "Boolean", "values": {}},
+                {"code": "temp_correction", "type": "Integer", "values": {"min": -9, "max": 9, "step": 1}},
+                {"code": "holiday_temp_set", "type": "Integer", "values": {"min": 50, "max": 400, "step": 5}},
             ],
             [{"code": "fault", "type": "Bitmap", "values": {"label": ["e1", "e2", "e3"]}}],
         )
@@ -103,10 +108,9 @@ class Sharing:
         self.sent.append((dev_id, commands))
         if not self.deaf:
             command = commands[0]
-            if command["code"] == "mode":
-                self.status[dev_id]["mode"] = command["value"]
-            else:
-                self.status[dev_id]["setpoint"] = command["value"] / 10
+            point = next(p for p in dps.table("fu1bfwza") if p.code == command["code"])
+            raw = command["value"]
+            self.status[dev_id][point.key] = raw / point.divisor if point.divisor != 1 else raw
 
 
 LAN_FULL = {
@@ -116,9 +120,7 @@ LAN_FULL = {
 }  # fmt: skip
 
 
-def make(
-    *, sharing: Any = None, with_lan: bool = True, **options: Any
-) -> tuple[Bridge, Transport, Clock, Any]:
+def make(*, sharing: Any = None, with_lan: bool = True, **options: Any) -> tuple[Bridge, Transport, Clock, Any]:
     clock = Clock()
     transport = Transport()
     channels = (("lan",) if with_lan else ()) + (("sharing",) if sharing is not None else ())
@@ -195,11 +197,11 @@ def test_lan_alone_publishes_every_property_it_read() -> None:
 
     assert transport.last("Room A/availability") == {"state": "online"}
     info = transport.last("bridge/info")
-    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 5
+    assert info["version"] == __version__ and info["contract"] == CONTRACT_VERSION == 7
     assert info["read_only"] is True
     assert info["writes"] == {
-        "enabled": False, "keys": ["current_heating_setpoint", "preset"], "devices": [], "device": None,
-        "closed": "writes are disabled in the options",
+        "enabled": False, "keys": ["current_heating_setpoint", "preset"], "presets": ["manual", "program"],
+        "settings": [], "devices": [], "device": None, "closed": "writes are disabled in the options",
     }  # fmt: skip
     assert info["channels"]["lan"]["state"] == "online"
     assert info["channels"]["sharing"] == info["channels"]["developer"] == {"enabled": False}
@@ -308,7 +310,10 @@ def test_closed_by_default_every_set_is_refused_and_nothing_is_sent() -> None:
     ("options", "reason"),
     [
         ({"writes_enabled": True}, "no thermostat is designated in the options"),
-        ({"writes_enabled": True, "write_devices": ("Room Z",)}, "none of the designated thermostats is among the devices"),  # noqa: E501
+        (
+            {"writes_enabled": True, "write_devices": ("Room Z",)},
+            "none of the designated thermostats is among the devices",
+        ),  # noqa: E501
         ({"write_devices": ("Room A",)}, "writes are disabled in the options"),
     ],
 )
@@ -332,7 +337,8 @@ def test_the_setpoint_of_the_designated_thermostat_is_written_and_read_back() ->
     bridge, transport, clock, sharing = make(**OPEN)
     info = transport.last("bridge/info")
     assert info["read_only"] is False and info["writes"] == {
-        "enabled": True, "keys": ["current_heating_setpoint", "preset"], "devices": ["Room A"], "device": "Room A",
+        "enabled": True, "keys": ["current_heating_setpoint", "preset"], "presets": ["manual", "program"],
+        "settings": [], "devices": ["Room A"], "device": "Room A",
     }  # fmt: skip
     clock.now += 5
     set_(bridge, "Room A", {"current_heating_setpoint": 20.5, "transaction": "abc"})
@@ -372,11 +378,12 @@ def test_designation_by_device_id() -> None:
         ("Room A", {"preset": "manual", "current_heating_setpoint": 20.5}, "one key per command"),
         ("Room A", {"current_heating_setpoint": 20.5, "system_mode": "off"}, "one key per command"),
         ("Room A", {"transaction": "x"}, "one key per command"),
-        ("Room A", {"preset": "eco"}, "only 'manual' and 'program' can be written, not 'eco'"),
-        ("Room A", {"preset": "holiday"}, "not 'holiday'"),
-        ("Room A", {"preset": "antifrost"}, "not 'antifrost'"),
-        ("Room A", {"preset": "schedule"}, "not 'schedule'"),
-        ("Room A", {"preset": 3}, "not 3"),
+        ("Room A", {"preset": "eco"}, "preset: 'eco' is not open (open: manual, program)"),
+        ("Room A", {"preset": "holiday"}, "'holiday' is not open"),
+        ("Room A", {"preset": "antifrost"}, "'antifrost' is not open"),
+        ("Room A", {"preset": "schedule"}, "'schedule' is not open"),
+        ("Room A", {"preset": 3}, "3 is not open"),
+        ("Room A", {"child_lock": "LOCK"}, "current_heating_setpoint or preset only"),
         ("Room A", {"current_heating_setpoint": 20.3}, "not on the device's step"),
         ("Room A", {"current_heating_setpoint": 4.5}, "outside the device's bounds"),
         ("Room A", {"current_heating_setpoint": 30.5}, "above the ceiling"),
@@ -515,11 +522,13 @@ def test_the_gate_itself_refuses_what_the_bridge_filters() -> None:
     gate = bridge.gate
     assert isinstance(gate, TrialGate) and gate.designated == {A}
     a, b = bridge.devices[A], bridge.devices[B]
-    with pytest.raises(WriteRefused, match="only current_heating_setpoint or preset"):
+    with pytest.raises(WriteRefused, match="switch: cannot be written"):
         gate.plan(a, sharing.spec(A), "switch", False)
+    with pytest.raises(WriteRefused, match="child_lock is not open"):
+        gate.plan(a, sharing.spec(A), "child_lock", True)
     with pytest.raises(WriteRefused, match="designated thermostats only"):
         gate.plan(b, sharing.spec(B), "setpoint", 20.0)
-    with pytest.raises(WriteRefused, match="only manual and program"):
+    with pytest.raises(WriteRefused, match="'eco' is not open"):
         gate.plan(a, sharing.spec(A), "mode", "eco")
     with pytest.raises(WriteRefused, match="weekly schedule"):
         gate.write_schedule(a, {"monday": []})
@@ -672,9 +681,7 @@ def test_login_shows_a_code_then_returns_the_session() -> None:
 def test_login_renews_the_code_then_gives_up() -> None:
     clock = Clock()
     shown: list[str] = []
-    login = session.Login(
-        "code", request=lambda code: "qr", poll=lambda qr, code: None, show=shown.append, clock=clock
-    )
+    login = session.Login("code", request=lambda code: "qr", poll=lambda qr, code: None, show=shown.append, clock=clock)
     for _ in range(session.MAX_QR_CODES + 3):
         login.tick()
         clock.now += session.QR_LIFETIME
@@ -776,3 +783,107 @@ def test_dry_run(capsys: pytest.CaptureFixture[str]) -> None:
 
 def test_lan_channel_needs_the_gateway_address() -> None:
     assert cli.main(["--options", "/nonexistent"]) == 2
+
+
+# --- further settings: candidates, trials, opening ---------------------------------------------
+
+
+def test_a_candidate_setting_named_in_the_options_stays_closed() -> None:
+    bridge, transport, _, sharing = make(**OPEN, write_settings=("child_lock", "preset_holiday"))
+    writes = transport.last("bridge/info")["writes"]
+    assert writes["keys"] == ["current_heating_setpoint", "preset"] and writes["settings"] == []
+    assert writes["refused"] == {
+        "child_lock": "candidate route: opens once the library records its supervised trial",
+        "preset_holiday": "candidate route: opens once the library records its supervised trial",
+    }
+    set_(bridge, "Room A", {"child_lock": "LOCK"})
+    set_(bridge, "Room A", {"preset": "holiday"})
+    assert sharing.sent == []
+
+
+@pytest.mark.parametrize(
+    ("setting", "payload", "command"),
+    [
+        ("preset_holiday", {"preset": "holiday"}, {"code": "mode", "value": "holiday"}),
+        ("preset_antifrost", {"preset": "antifrost"}, {"code": "mode", "value": "hors"}),
+        ("preset_eco", {"preset": "eco"}, {"code": "mode", "value": "eco"}),
+        ("child_lock", {"child_lock": "UNLOCK"}, {"code": "child_lock", "value": False}),
+        ("window_detection", {"window_detection": "ON"}, {"code": "window_check", "value": True}),
+        ("local_temperature_calibration", {"local_temperature_calibration": -2},
+         {"code": "temp_correction", "value": -2}),
+        ("holiday_temperature", {"holiday_temperature": 7.5}, {"code": "holiday_temp_set", "value": 75}),
+    ],
+)  # fmt: skip
+def test_a_trial_opens_one_setting_on_one_thermostat(setting: str, payload: Any, command: Any) -> None:
+    bridge, transport, clock, sharing = make(
+        sharing="account", writes_enabled=True, write_devices=("Room A", "Room B 1"),
+        trial_setting=setting, trial_device="Room B 1",
+    )  # fmt: skip
+    writes = transport.last("bridge/info")["writes"]
+    assert writes["trial"]["setting"] == setting and writes["trial"]["device"] == "Room B 1"
+    assert "closed" not in writes["trial"] and writes["keys"] == ["current_heating_setpoint", "preset"]
+    set_(bridge, "Room A", payload)  # designated, not the trial thermostat
+    assert sharing.sent == [] and "is not open" in transport.last("bridge/response/device/set")["error"]
+    set_(bridge, "Room B 1", payload)
+    assert sharing.sent == [(B, [command])]
+    response = transport.last("bridge/response/device/set")
+    assert response["status"] == "ok", response
+    key, value = next(iter(payload.items()))
+    assert transport.last("Room B 1")[key] == value  # read back, not assumed
+    clock.now += 11
+    if key == "preset":
+        others = {"holiday", "antifrost", "eco"} - {value}
+        for other in others:
+            set_(bridge, "Room B 1", {"preset": other})
+            assert "is not open" in transport.last("bridge/response/device/set")["error"]
+        set_(bridge, "Room B 1", {"preset": "program"})  # back to the schedule, proven
+        assert transport.last("bridge/response/device/set")["status"] == "ok"
+    assert bridge.router.trials == {contract.SETTINGS[setting].write_name: B}
+
+
+def test_a_trial_on_a_thermostat_that_is_not_designated_does_not_open() -> None:
+    bridge, transport, _, sharing = make(**OPEN, trial_setting="child_lock", trial_device="Room B 1")
+    trial = transport.last("bridge/info")["writes"]["trial"]
+    assert trial == {
+        "setting": "child_lock", "key": "child_lock", "device": None,
+        "closed": "the trial thermostat is not among the designated thermostats",
+    }  # fmt: skip
+    set_(bridge, "Room B 1", {"child_lock": "LOCK"})
+    set_(bridge, "Room A", {"child_lock": "LOCK"})
+    assert sharing.sent == [] and bridge.router.trials == {}
+
+
+def test_a_proven_setting_opens_on_every_designated_thermostat(monkeypatch: pytest.MonkeyPatch) -> None:
+    proven = router.Route((Channel.SHARING,), router.RouteState.PROVEN, "synthetic")
+    monkeypatch.setitem(router.ROUTES["fu1bfwza"], router.Operation.CHILD_LOCK, proven)
+    monkeypatch.setitem(router.MODE_ROUTES["fu1bfwza"], "holiday", proven)
+    bridge, transport, clock, sharing = make(
+        sharing="account", writes_enabled=True, write_devices=("Room A", "Room B 1"),
+        write_settings=("child_lock", "preset_holiday", "window_detection"),
+    )  # fmt: skip
+    writes = transport.last("bridge/info")["writes"]
+    assert writes["keys"] == ["current_heating_setpoint", "preset", "child_lock"]
+    assert writes["presets"] == ["manual", "program", "holiday"]
+    assert writes["settings"] == ["child_lock", "preset_holiday"]
+    assert list(writes["refused"]) == ["window_detection"]
+    set_(bridge, "Room A", {"child_lock": "UNLOCK"})
+    set_(bridge, "Room B 1", {"preset": "holiday"})
+    assert sharing.sent == [
+        (A, [{"code": "child_lock", "value": False}]),
+        (B, [{"code": "mode", "value": "holiday"}]),
+    ]
+    set_(bridge, "Room A", {"window_detection": "ON"})
+    error = transport.last("bridge/response/device/set")["error"]
+    assert "current_heating_setpoint or preset or child_lock only" in error
+
+
+def test_settings_options_are_checked() -> None:
+    with pytest.raises(config.ConfigError, match="unknown setting 'night_mode'"):
+        config.validate(config.Settings(write_settings=("night_mode",)))
+    with pytest.raises(config.ConfigError, match="trial_setting"):
+        config.validate(config.Settings(trial_setting="eco"))
+    with pytest.raises(config.ConfigError, match="go together"):
+        config.validate(config.Settings(trial_setting="child_lock"))
+    settings = config.load(None, {"TUYAPILOT_WRITE_SETTINGS": "child_lock, preset_holiday"})
+    assert settings.write_settings == ("child_lock", "preset_holiday")
+    assert set(config.SETTING_NAMES) == set(contract.SETTINGS)

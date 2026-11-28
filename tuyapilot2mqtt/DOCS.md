@@ -7,7 +7,7 @@ affiliated with Tuya.
 
 **Read only by default.** It sends nothing to a thermostat unless you open the writes of this
 version (preset `manual` / `program` and the manual setpoint, on the thermostats you designate,
-see [Writing](#writing-preset-and-setpoint-on-designated-thermostats)). It must be the only client
+see [Writing](#writing-preset-setpoint-and-settings-on-designated-thermostats)). It must be the only client
 of the Smart Life account (disable the stock `tuya` integration).
 
 ## What it reads
@@ -69,7 +69,7 @@ channel turns `unauthenticated` and a new QR code appears on the page.
 The QR code is a short-lived login token: it is never written in the log, and the page answers
 Home Assistant's ingress only; do not share a screenshot of it.
 
-## Writing: preset and setpoint on designated thermostats
+## Writing: preset, setpoint and settings on designated thermostats
 
 Closed by default. To open it:
 
@@ -97,6 +97,30 @@ never from the request.
 Set `writes_enabled` back to `false` to close it. Each write and each refusal is in the log,
 with the raw command sent (data-point code and raw value, never an id or a key).
 
+### Further settings, one by one
+
+Each further setting of the thermostat is a **closed candidate** until a supervised trial on one
+thermostat proves it; the library then marks it proven, and you open it by name in
+`write_settings`:
+
+| Setting | Command it opens |
+|---|---|
+| `preset_holiday` | `{"preset": "holiday"}` (the thermostat follows `holiday_temperature`) |
+| `preset_antifrost` | `{"preset": "antifrost"}` (frost protection, raw mode `hors`) |
+| `preset_eco` | `{"preset": "eco"}` (the thermostat follows its eco setpoint) |
+| `child_lock` | `{"child_lock": "LOCK" \| "UNLOCK"}` |
+| `window_detection` | `{"window_detection": "ON" \| "OFF"}` |
+| `local_temperature_calibration` | `{"local_temperature_calibration": -9…9}` |
+| `holiday_temperature` | `{"holiday_temperature": <°C>}`, the device's bounds and step, 30 °C at most |
+
+A setting named in `write_settings` whose route is still a candidate stays closed:
+`bridge/info.writes.refused` says so. The eco and frost-protection setpoints cannot be opened:
+the sharing API does not declare them writable.
+
+**A trial** opens one candidate on one designated thermostat, for the owner's supervised test:
+`trial_setting` (one of the names above) and `trial_device` (a thermostat of `write_devices`).
+`bridge/info.writes.trial` says what is open and where. Empty both once the trial is done.
+
 ## Options
 
 | Option | Default | Meaning |
@@ -117,6 +141,8 @@ with the raw command sent (data-point code and raw value, never an id or a key).
 | `developer_access_id`, `developer_access_secret`, `developer_region` | empty, empty, `eu` | Tuya IoT platform project, for the `developer` channel. Without them the channel is reported `unavailable`. It only reads the eco and frost setpoints in this version |
 | `writes_enabled` | `false` | Opens the writes of this version on the thermostats of `write_devices` |
 | `write_devices` | empty | The thermostats that can be written: their published names, or their Tuya device ids (replaces `write_device` of 0.2.x) |
+| `write_settings` | empty | Further settings to open on those thermostats, once proven (table above) |
+| `trial_setting`, `trial_device` | empty | A supervised trial: one candidate setting opened on one designated thermostat |
 
 ## What it publishes
 
