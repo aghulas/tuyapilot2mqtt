@@ -378,7 +378,11 @@ library's gate (`"schedule: …"`), with nothing sent.
 Route: developer API (device shadow properties), the only one that returns these data points;
 the LAN does not return them and the sharing API does not declare them. Read on six thermostats
 (2026-11-03, 2026-11-28); written read-modify-write and restored on one thermostat
-(2026-11-14). The developer API signs in with the developer project's credentials, not as a
+(2026-11-14), then **through this bridge**: six schedules read, one day written on one
+thermostat and restored, each confirmed in 5 to 11 s, with the sharing channel online
+throughout (2026-11-28,
+[trial 6](https://github.com/aghulas/ha-tuya-pilot-wire/blob/main/docs/validation/2026-11-28-trial-6-weekly-schedule.md)).
+The developer API signs in with the developer project's credentials, not as a
 Smart Life client: it does not touch the account's session held by the sharing channel.
 
 Rooms are not part of this contract: they belong to the Companion.
