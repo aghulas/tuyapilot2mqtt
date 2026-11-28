@@ -64,8 +64,11 @@ policy of the version (`bridge.py`).
 ## Development
 
 ```bash
-python3 -m venv .venv && .venv/bin/pip install "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ git+https://github.com/aghulas/pytuya-pilot-wire@v0.2.2" -e "./tuyapilot2mqtt[dev]"
+python3 -m venv .venv && .venv/bin/pip install "pytuya-pilot-wire[sharing,lan,developer,mqtt] @ git+https://github.com/aghulas/pytuya-pilot-wire@v0.3.0" -e "./tuyapilot2mqtt[dev]"
 ```
+
+The library version is the tag pinned by `PYTUYA_PILOT_WIRE_REF` in
+[`tuyapilot2mqtt/Dockerfile`](tuyapilot2mqtt/Dockerfile); CI installs the same one.
 
 ```bash
 cd tuyapilot2mqtt && ../.venv/bin/ruff check . ../tests && ../.venv/bin/pytest -q && ../.venv/bin/tuyapilot2mqtt --dry-run

@@ -8,12 +8,10 @@ arch:
   - amd64
 init: false
 startup: services
-boot: auto
 services:
   - mqtt:want
 # The page of the Smart Life QR-code login ("Open web UI"); reachable through Home Assistant only.
 ingress: true
-ingress_port: 8099
 map:
   - type: homeassistant_config
     read_only: true
