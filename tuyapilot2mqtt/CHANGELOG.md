@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- Add-on store icon and logo; the Home Assistant add-on linter runs in CI.
+
 ## 0.3.0
 
 MQTT contract **version 5**. Built on `pytuya-pilot-wire` 0.3.0, pinned by tag.

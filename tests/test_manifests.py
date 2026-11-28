@@ -41,3 +41,11 @@ def test_contract_version_is_the_one_documented() -> None:
 
 def test_changelog_has_the_version() -> None:
     assert f"## {tuyapilot2mqtt.__version__}" in (ADDON / "CHANGELOG.md").read_text(encoding="utf-8")
+
+
+def test_store_images() -> None:
+    """The add-on store shows an icon (square) and a logo (wide)."""
+    for name, (width, height) in {"icon.png": (128, 128), "logo.png": (250, 100)}.items():
+        data = (ADDON / name).read_bytes()
+        assert data[:8] == b"\x89PNG\r\n\x1a\n", name
+        assert (int.from_bytes(data[16:20]), int.from_bytes(data[20:24])) == (width, height), name
