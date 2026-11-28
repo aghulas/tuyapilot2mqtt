@@ -231,13 +231,13 @@ options whose route is still a candidate is in `writes.refused` and stays closed
 
 | Setting | `/set` | Values | Data point | State |
 |---|---|---|---|---|
-| `preset_holiday` | `preset` | `"holiday"` | DP 2 `mode` = `holiday` | candidate |
-| `preset_antifrost` | `preset` | `"antifrost"` | DP 2 `mode` = `hors`, a value outside the declared list | candidate |
-| `preset_eco` | `preset` | `"eco"` | DP 2 `mode` = `eco` | candidate |
-| `child_lock` | `child_lock` | `"LOCK"` \| `"UNLOCK"` | DP 39 `child_lock` | candidate |
-| `window_detection` | `window_detection` | `"ON"` \| `"OFF"` | DP 29 `window_check` | candidate |
-| `local_temperature_calibration` | `local_temperature_calibration` | int, the device's bounds (−9…9, step 1) | DP 19 `temp_correction` | candidate |
-| `holiday_temperature` | `holiday_temperature` | °C, the device's bounds and step (5…40 by 0.5), 30 °C at most | DP 24 `holiday_temp_set` | candidate |
+| `preset_holiday` | `preset` | `"holiday"` | DP 2 `mode` = `holiday` | proven (trial 3a, 2026-11-28): the thermostat follows `holiday_temperature`, with no period; it stays there until another mode is written |
+| `preset_antifrost` | `preset` | `"antifrost"` | DP 2 `mode` = `hors`, a value outside the declared list | **no route**: the sharing API refused it (trial 3b, 2026-11-28) |
+| `preset_eco` | `preset` | `"eco"` | DP 2 `mode` = `eco` | proven (trial 3c, 2026-11-28): the thermostat follows its eco setpoint, then reported in `current_heating_setpoint` |
+| `child_lock` | `child_lock` | `"LOCK"` \| `"UNLOCK"` | DP 39 `child_lock` | proven (trial 4a, 2026-11-28) |
+| `window_detection` | `window_detection` | `"ON"` \| `"OFF"` | DP 29 `window_check` | proven (trial 4b, 2026-11-28) |
+| `local_temperature_calibration` | `local_temperature_calibration` | int, the device's bounds (−9…9, step 1) | DP 19 `temp_correction` | proven (trial 5a, 2026-11-28): shifts `local_temperature` by the value |
+| `holiday_temperature` | `holiday_temperature` | °C, the device's bounds and step (5…40 by 0.5), 30 °C at most | DP 24 `holiday_temp_set` | proven (trial 5b, 2026-11-28) |
 
 Each is checked against the device's own declaration before sending, sent once and read back
 like the two writes above; none depends on the mode. **No route**: `eco_temperature` and
@@ -323,10 +323,10 @@ Routes of the commands:
 |---|---|---|
 | `{"current_heating_setpoint": 19.5}` | sharing API | proven on one thermostat in `manual` mode (2026-10-31), then through this bridge on two thermostats (2026-11-28, [trial 2](https://github.com/aghulas/ha-tuya-pilot-wire/blob/main/docs/validation/2026-11-28-trial-2-preset-and-setpoint.md)); **open for the designated thermostats, in `manual` mode only** |
 | `{"preset": "manual" \| "program"}` | sharing API | proven on one thermostat (2026-10-31), then through this bridge on two thermostats (2026-11-28, same trial); **open for the designated thermostats** |
-| `{"preset": "eco" \| "holiday"}` | sharing API | candidates, closed (§4.1) |
-| `{"preset": "antifrost"}` | sharing API | candidate, closed (§4.1): the raw value `hors` is outside the declared list; whether the account accepts it is the trial's to establish |
+| `{"preset": "eco" \| "holiday"}` | sharing API | proven through this bridge (2026-11-28, trials 3a and 3c); open where the owner names them in `write_settings` (§4.1) |
+| `{"preset": "antifrost"}` | none | no route: the sharing API refused the raw value `hors` (2026-11-28, trial 3b) |
 | `{"system_mode": "heat" \| "off"}` | sharing API | proven on one thermostat (2026-10-31); closed in this version |
-| `{"child_lock": …}`, `{"window_detection": …}`, `{"local_temperature_calibration": …}`, `{"holiday_temperature": …}` | sharing API | candidates, closed (§4.1): declared by the device, never written |
+| `{"child_lock": …}`, `{"window_detection": …}`, `{"local_temperature_calibration": …}`, `{"holiday_temperature": …}` | sharing API | proven through this bridge (2026-11-28, trials 4a, 4b, 5a, 5b); open where the owner names them in `write_settings` (§4.1) |
 | `{"eco_temperature": …}`, `{"antifrost_temperature": …}` | none | no route: not declared writable by the sharing API |
 
 ## 5. Requests (`<prefix>/bridge/request/<action>`)

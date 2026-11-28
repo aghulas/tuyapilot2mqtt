@@ -794,24 +794,56 @@ def test_lan_channel_needs_the_gateway_address() -> None:
 # --- further settings: candidates, trials, opening ---------------------------------------------
 
 
+@pytest.fixture
+def candidates(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Child lock and the holiday mode are candidates again: the candidate machinery, under test."""
+    candidate = router.Route((Channel.SHARING,), router.RouteState.CANDIDATE, "synthetic")
+    monkeypatch.setitem(router.ROUTES["fu1bfwza"], router.Operation.CHILD_LOCK, candidate)
+    monkeypatch.setitem(router.MODE_ROUTES["fu1bfwza"], "holiday", candidate)
+
+
+@pytest.mark.usefixtures("candidates")
 def test_a_candidate_setting_named_in_the_options_stays_closed() -> None:
-    bridge, transport, _, sharing = make(**OPEN, write_settings=("child_lock", "preset_holiday"))
+    bridge, transport, _, sharing = make(**OPEN, write_settings=("child_lock", "preset_holiday", "preset_antifrost"))
     writes = transport.last("bridge/info")["writes"]
     assert writes["keys"] == ["current_heating_setpoint", "preset"] and writes["settings"] == []
     assert writes["refused"] == {
         "child_lock": "candidate route: opens once the library records its supervised trial",
         "preset_holiday": "candidate route: opens once the library records its supervised trial",
+        "preset_antifrost": "no route: the library refuses this write (see its route table)",
     }
     set_(bridge, "Room A", {"child_lock": "LOCK"})
     set_(bridge, "Room A", {"preset": "holiday"})
     assert sharing.sent == []
 
 
+def test_the_settings_proven_on_trial_open_on_every_designated_thermostat() -> None:
+    proven = ("preset_holiday", "preset_eco", "child_lock", "window_detection",
+              "local_temperature_calibration", "holiday_temperature")  # fmt: skip
+    bridge, transport, clock, sharing = make(
+        sharing="account", writes_enabled=True, write_devices=("Room A", "Room B 1"),
+        write_settings=(*proven, "preset_antifrost"),
+    )  # fmt: skip
+    writes = transport.last("bridge/info")["writes"]
+    assert writes["settings"] == list(proven)
+    assert writes["keys"] == [
+        "current_heating_setpoint", "preset", "child_lock", "window_detection",
+        "local_temperature_calibration", "holiday_temperature",
+    ]  # fmt: skip
+    assert writes["presets"] == ["manual", "program", "holiday", "eco"]
+    assert list(writes["refused"]) == ["preset_antifrost"]
+    set_(bridge, "Room B 1", {"holiday_temperature": 7.5})
+    assert sharing.sent == [(B, [{"code": "holiday_temp_set", "value": 75}])]
+    assert transport.last("Room B 1")["holiday_temperature"] == 7.5
+    set_(bridge, "Room A", {"preset": "antifrost"})
+    assert "'antifrost' is not open" in transport.last("bridge/response/device/set")["error"]
+    assert len(sharing.sent) == 1
+
+
 @pytest.mark.parametrize(
     ("setting", "payload", "command"),
     [
         ("preset_holiday", {"preset": "holiday"}, {"code": "mode", "value": "holiday"}),
-        ("preset_antifrost", {"preset": "antifrost"}, {"code": "mode", "value": "hors"}),
         ("preset_eco", {"preset": "eco"}, {"code": "mode", "value": "eco"}),
         ("child_lock", {"child_lock": "UNLOCK"}, {"code": "child_lock", "value": False}),
         ("window_detection", {"window_detection": "ON"}, {"code": "window_check", "value": True}),
@@ -860,9 +892,8 @@ def test_a_trial_on_a_thermostat_that_is_not_designated_does_not_open() -> None:
 
 
 def test_a_proven_setting_opens_on_every_designated_thermostat(monkeypatch: pytest.MonkeyPatch) -> None:
-    proven = router.Route((Channel.SHARING,), router.RouteState.PROVEN, "synthetic")
-    monkeypatch.setitem(router.ROUTES["fu1bfwza"], router.Operation.CHILD_LOCK, proven)
-    monkeypatch.setitem(router.MODE_ROUTES["fu1bfwza"], "holiday", proven)
+    candidate = router.Route((Channel.SHARING,), router.RouteState.CANDIDATE, "synthetic")
+    monkeypatch.setitem(router.ROUTES["fu1bfwza"], router.Operation.WINDOW_DETECTION, candidate)
     bridge, transport, clock, sharing = make(
         sharing="account", writes_enabled=True, write_devices=("Room A", "Room B 1"),
         write_settings=("child_lock", "preset_holiday", "window_detection"),

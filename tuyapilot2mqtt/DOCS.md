@@ -104,14 +104,14 @@ with the raw command sent (data-point code and raw value, never an id or a key).
 
 ### Further settings, one by one
 
-Each further setting of the thermostat is a **closed candidate** until a supervised trial on one
-thermostat proves it; the library then marks it proven, and you open it by name in
-`write_settings`:
+Each further setting of the thermostat was a **closed candidate** until a supervised trial on one
+thermostat proved it; the library then marks it proven, and you open it by name in
+`write_settings`. Since 0.5.1 all of them are proven but `preset_antifrost`:
 
 | Setting | Command it opens |
 |---|---|
 | `preset_holiday` | `{"preset": "holiday"}` (the thermostat follows `holiday_temperature`) |
-| `preset_antifrost` | `{"preset": "antifrost"}` (frost protection, raw mode `hors`) |
+| `preset_antifrost` | none: the sharing API refused the frost-protection value on trial; it stays closed |
 | `preset_eco` | `{"preset": "eco"}` (the thermostat follows its eco setpoint) |
 | `child_lock` | `{"child_lock": "LOCK" \| "UNLOCK"}` |
 | `window_detection` | `{"window_detection": "ON" \| "OFF"}` |
