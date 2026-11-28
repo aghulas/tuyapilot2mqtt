@@ -21,8 +21,13 @@ Two channels, each for what it is proven to give:
   power, cumulative energy, eco and frost setpoints. While the account is not connected, the
   gateway also gives everything else it returns.
 
-The weekly schedule (developer API) is not available yet. A value that was not read is **absent**
-from the published state, never guessed.
+A third channel is optional:
+
+- **Your Tuya developer project** (developer API): the **weekly schedule**, read with the eco and
+  frost setpoints once an hour (one request per thermostat), and on demand; written on the
+  designated thermostats when writes are enabled. See [Weekly schedule](#weekly-schedule).
+
+A value that was not read is **absent** from the published state, never guessed.
 
 ## Before you start
 
@@ -114,9 +119,32 @@ with the raw command sent (data-point code and raw value, never an id or a key).
 | `lan_product_id` | `fu1bfwza` | Product assumed for the thermostats whose entry in the keys file has no `product_id`. Only `fu1bfwza` is supported |
 | `sharing_user_code` | empty | User code of the Smart Life app, for the QR-code login |
 | `sharing_session_file` | `/data/sharing_session.json` | Where the session is kept. Leave it |
-| `developer_access_id`, `developer_access_secret`, `developer_region` | empty, empty, `eu` | Tuya IoT platform project, for the `developer` channel. Without them the channel is reported `unavailable`. It only reads the eco and frost setpoints in this version |
+| `developer_access_id`, `developer_access_secret`, `developer_region` | empty, empty, `eu` | Tuya IoT platform project, for the `developer` channel (add `developer` to `channels`). Without them the channel is reported `unavailable`. It reads the eco and frost setpoints and the weekly schedule, and writes the schedule of the designated thermostats when writes are enabled |
 | `writes_enabled` | `false` | Opens the writes of this version on the thermostats of `write_devices` |
 | `write_devices` | empty | The thermostats that can be written: their published names, or their Tuya device ids (replaces `write_device` of 0.2.x) |
+
+## Weekly schedule
+
+The schedule lives in data points that only the Tuya **developer API** returns: neither the Smart
+Life account nor the gateway gives them. To use it:
+
+1. On [platform.tuya.com](https://platform.tuya.com), open your cloud project (the one that gave
+   the gateway's local key), check that its **IoT Core** subscription is active and that your
+   Smart Life account is linked to it (Devices → Link App Account).
+2. In the project's overview, copy the **Access ID** and the **Access Secret**. Type them yourself
+   into the add-on's options `developer_access_id` and `developer_access_secret`, set
+   `developer_region` (`eu` for the Central Europe data centre), add `developer` to `channels`,
+   save and restart the add-on.
+3. `bridge/info` shows `channels.developer.state: online` after the first read.
+
+The developer API signs in with the **project's** credentials, not with your Smart Life account:
+it does not open a Smart Life session, and the account's session held by this add-on stays as it
+is. Its calls count against the project's quota: the add-on makes one per thermostat an hour, plus
+one per `schedule/get` and two or three per `schedule/set`.
+
+The schedule is published in each thermostat's state (`tuya.schedule`), read through
+`bridge/request/schedule/get` and written through `bridge/request/schedule/set` (one day or more,
+each described in full; the other days are left as they are; the thermostat is read back).
 
 ## What it publishes
 
@@ -134,7 +162,7 @@ All retained. The full description is the
 [MQTT contract](https://github.com/aghulas/tuyapilot2mqtt/blob/main/docs/mqtt-contract.md).
 
 Commands (`tuyapilot2mqtt/<name>/set`, `tuyapilot2mqtt/bridge/request/…`) are answered on
-`tuyapilot2mqtt/bridge/response/…`. Everything but the writes described above gets
+`tuyapilot2mqtt/bridge/response/…`. Everything but the reads and writes described above gets
 `"status": "error"` and a message saying why; nothing is sent to a thermostat.
 
 The add-on creates **no entity** in Home Assistant by itself (no MQTT discovery): the entities are

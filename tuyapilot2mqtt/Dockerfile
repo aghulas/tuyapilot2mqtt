@@ -5,7 +5,7 @@ WORKDIR /app
 
 # pytuya-pilot-wire holds everything that knows Tuya. It is not on PyPI yet: pinned here by tag
 # of its repository (a tarball, so the image needs no git).
-ARG PYTUYA_PILOT_WIRE_REF="v0.3.0"
+ARG PYTUYA_PILOT_WIRE_REF="v0.4.0"
 COPY pyproject.toml /app/
 COPY src /app/src
 RUN pip install --no-cache-dir \

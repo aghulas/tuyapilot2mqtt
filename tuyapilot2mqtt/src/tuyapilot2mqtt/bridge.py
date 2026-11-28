@@ -10,10 +10,14 @@ repository says beyond the library's draft-0 codec, and the policy of this versi
 - **two writes, one key per command**, on the thermostats the owner designated
   (``write_devices``), when the owner enabled writes and the sharing channel is connected:
   ``preset`` to ``manual`` or ``program``, and ``current_heating_setpoint`` while the thermostat
-  is in ``manual`` mode. Everything else on ``/set`` and every ``bridge/request/*`` is refused
-  before the library sees it, and refused a second time by the gate (which reads the device again
-  just before sending);
-- a rate limit per thermostat: one write every 10 s, 30 an hour, counted on what was sent;
+  is in ``manual`` mode. Everything else on ``/set`` is refused before the library sees it, and
+  refused a second time by the gate (which reads the device again just before sending);
+- the **weekly schedule** through the developer channel: ``bridge/request/schedule/get`` for every
+  thermostat, ``bridge/request/schedule/set`` for the designated ones when writes are enabled
+  (read-modify-write of the 28 data points by the library's gate, read back); the schedule read
+  with the settings of each developer pass is published in the state (``tuya.schedule``);
+- a rate limit per thermostat: one write every 10 s, 30 an hour, counted on what was sent (a
+  schedule write is one);
 - the raw command actually sent to the device is logged (data-point code and raw value, no id).
 """
 
@@ -27,10 +31,10 @@ from collections.abc import Callable, Mapping
 from typing import Any
 
 from pytuya_pilot_wire import __version__ as library_version
-from pytuya_pilot_wire import dialect, dps
+from pytuya_pilot_wire import dialect, dps, schedule
 from pytuya_pilot_wire.bridge import Bridge as LibraryBridge
 from pytuya_pilot_wire.bridge import BridgeConfig
-from pytuya_pilot_wire.errors import WriteRefused
+from pytuya_pilot_wire.errors import PilotWireError, WriteRefused
 from pytuya_pilot_wire.gate import PlannedWrite, ScheduleResult, SharingWriter, WriteGate, setpoint_mode_refusal
 from pytuya_pilot_wire.model import Channel, Device, DeviceSpec, DeviceState, Reading
 
@@ -41,7 +45,7 @@ from .devices import LocalInventory
 log = logging.getLogger("tuyapilot2mqtt")
 
 NOTHING_SENT = "nothing was sent to the device"
-REQUEST_ERROR = f"request not available in this version; {NOTHING_SENT}"
+REQUESTS = ("schedule/get", "schedule/set")
 
 # Library channel states -> contract states (§1.1).
 _STATES = {"idle": "starting", "ok": "online", "error": "offline", "unauthenticated": "unauthenticated"}
@@ -70,13 +74,50 @@ class _LoggedSend:
         self._writer.send(dev_id, commands)
 
 
+class _Developer:
+    """The developer channel, keeping the schedule each read brings and logging what it writes.
+
+    A read pass of the library calls :meth:`read`: the settings and the schedule come from the same
+    answer of the API (one call), and the schedule is handed to ``on_schedule``.
+    """
+
+    def __init__(
+        self,
+        channel: Any,
+        on_schedule: Callable[[str, dict[str, Any], float], None],
+        on_send: Callable[[str], None],
+    ) -> None:
+        self._channel = channel
+        self._on_schedule = on_schedule
+        self._on_send = on_send
+
+    def read(self, device: Device) -> Reading:
+        reading, week = self._channel.read_with_schedule(device)
+        self._on_schedule(device.dev_id, week, reading.at)
+        return reading
+
+    def read_schedule(self, dev_id: str) -> dict[str, Any]:
+        return self._channel.read_schedule(dev_id)
+
+    def schedule_parts(self, dev_id: str) -> dict[str, str]:
+        return self._channel.schedule_parts(dev_id)
+
+    def issue_schedule_parts(self, dev_id: str, parts: Mapping[str, str]) -> None:
+        log.warning("WRITE sent to a designated thermostat, once: schedule parts %s", ", ".join(sorted(parts)))
+        self._on_send(dev_id)  # counted before the call, as on /set
+        self._channel.issue_schedule_parts(dev_id, parts)
+
+    def lan_inventory(self) -> Any:
+        return self._channel.lan_inventory()
+
+
 class TrialGate(WriteGate):
     """The library's write gate, narrowed to the writes this version opens.
 
     The manual setpoint and the mode (``manual`` or ``program``) of a designated thermostat pass on
     to the library's checks (route, the device's own bounds, step and modes, ceiling, fresh read,
     setpoint refused in any mode but ``manual``, one send, read-back). Any other key, any other
-    device, any other mode and the weekly schedule stop here.
+    device and any other mode stop here; the weekly schedule passes for a designated thermostat.
     """
 
     designated: frozenset[str] = frozenset()  # Tuya device ids of the designated thermostats
@@ -108,7 +149,9 @@ class TrialGate(WriteGate):
         return super().plan(device, spec, key, value)
 
     def write_schedule(self, device: Device, days: Mapping[str, Any]) -> ScheduleResult:
-        raise WriteRefused("the weekly schedule cannot be written in this version")
+        if device.dev_id not in self.designated:
+            raise WriteRefused("writes are open for the designated thermostats only")
+        return super().write_schedule(device, days)
 
 
 class Bridge(LibraryBridge):
@@ -134,13 +177,17 @@ class Bridge(LibraryBridge):
             bridge_version=__version__,
         )
         extra = {} if clock is None else {"clock": clock}
-        super().__init__(transport, sharing=sharing, lan=lan, developer=developer, config=config, **extra)
-        self.settings = settings
+        # Schedules read through the developer channel: {dev_id: (week, read at)}.
+        self._schedules: dict[str, tuple[dict[str, Any], float]] = {}
+        self._schedule_changed: set[str] = set()
         self._sent_at: dict[str, deque[float]] = {}
+        wrapped = None if developer is None else _Developer(developer, self._keep_schedule, self._count_send)
+        super().__init__(transport, sharing=sharing, lan=lan, developer=wrapped, config=config, **extra)
+        self.settings = settings
         self.gate = TrialGate(
             self.router,
             sharing=sharing,
-            developer=None,
+            developer=wrapped,
             enabled=settings.writes_enabled,
             on_send=self._count_send,
             **(gate_options or {}),
@@ -179,6 +226,42 @@ class Bridge(LibraryBridge):
         if not self._designated():
             return "none of the designated thermostats is among the devices"
         return None
+
+    def schedule_closed_reason(self) -> str | None:
+        """Why ``schedule/set`` cannot pass now, or ``None`` when it is open."""
+        if not self.settings.writes_enabled:
+            return "writes are disabled in the options"
+        if not self.settings.write_devices:
+            return "no thermostat is designated in the options"
+        reason = self._developer_closed()
+        if reason is not None:
+            return reason
+        if not self._designated():
+            return "none of the designated thermostats is among the devices"
+        return None
+
+    def _developer_closed(self) -> str | None:
+        """Why the developer channel cannot serve a schedule now, or ``None``."""
+        if "developer" not in self.settings.channels:
+            return "the developer channel is not enabled"
+        status = self.status.get(Channel.DEVELOPER)
+        if status is None or self.developer is None:
+            return "the developer channel is unavailable (credentials missing)"
+        if status.state == "unauthenticated":
+            return "the developer project refused the credentials"
+        if status.state != "ok":
+            return "the developer channel is not connected"
+        return None
+
+    # -- weekly schedule held from the developer reads ---------------------------------------
+
+    def _keep_schedule(self, dev_id: str, week: dict[str, Any], at: float) -> None:
+        if not week:  # nothing readable: the previous reading stays, never an empty schedule
+            return
+        held = self._schedules.get(dev_id)
+        if held is None or held[0] != week:
+            self._schedule_changed.add(dev_id)
+        self._schedules[dev_id] = (week, at)
 
     # -- rate limit -------------------------------------------------------------------------
 
@@ -234,14 +317,18 @@ class Bridge(LibraryBridge):
         designated = self._designated()
         self.gate.designated = frozenset(designated)
         names = [self.names[dev_id] for dev_id in designated]
+        schedule_reason = self.schedule_closed_reason()
         writes: dict[str, Any] = {
             "enabled": self.settings.writes_enabled,
             "keys": list(contract.OPEN_SET_KEYS),
             "devices": names,
             "device": names[0] if names else None,  # contract 4 and earlier; the first of `devices`
+            "requests": [] if schedule_reason else ["schedule/set"],
         }
         if reason:
             writes["closed"] = reason
+        if schedule_reason:
+            writes["requests_closed"] = schedule_reason
         info = {
             "version": __version__,
             "contract": CONTRACT_VERSION,
@@ -313,6 +400,12 @@ class Bridge(LibraryBridge):
         self._publish(self._topic("bridge", "devices"), self._descriptors)
         return True
 
+    def replace_channel(self, channel: Channel, client: Any) -> None:
+        """Swap in a rebuilt channel client; a developer client keeps its schedule hook."""
+        if channel is Channel.DEVELOPER and not isinstance(client, _Developer):
+            client = _Developer(client, self._keep_schedule, self._count_send)
+        super().replace_channel(channel, client)
+
     def resume_sharing(self, channel: Any) -> None:
         """Put a logged-in sharing channel in service and list the devices again at once."""
         self.replace_channel(Channel.SHARING, channel)
@@ -327,6 +420,10 @@ class Bridge(LibraryBridge):
         LAN alone published every property in versions 1 and 2 of the contract, checked against
         the other readers (M3); it does so again whenever the sharing channel is away.
         """
+        if channel is Channel.DEVELOPER:
+            applied = super()._apply(channel, readings)
+            changed, self._schedule_changed = self._schedule_changed, set()
+            return applied | (changed & set(self.states))
         if channel is not Channel.LAN or self._sharing_connected():
             return super()._apply(channel, readings)
         applied: set[str] = set()
@@ -341,7 +438,8 @@ class Bridge(LibraryBridge):
 
     def publish_state(self, dev_id: str) -> None:
         encoded = dialect.encode_state(self.states[dev_id], self._spec(dev_id))
-        self._publish(self._topic(self.names[dev_id]), contract.state(encoded, self._last_read.get(dev_id)))
+        published = contract.state(encoded, self._last_read.get(dev_id), self._schedules.get(dev_id))
+        self._publish(self._topic(self.names[dev_id]), published)
 
     def _refresh_availability(self) -> None:
         """Online: a reading younger than ``stale_after`` and, when the sharing API is connected,
@@ -362,7 +460,7 @@ class Bridge(LibraryBridge):
         if self._descriptors:
             self._publish(self._topic("bridge", "devices"), self._descriptors)
         for dev_id, state in self.states.items():
-            if state.values:
+            if state.values or dev_id in self._schedules:
                 self.publish_state(dev_id)
         for dev_id, online in self._availability.items():
             if dev_id in self.names:
@@ -439,10 +537,104 @@ class Bridge(LibraryBridge):
         super()._respond(action, **fields)
 
     def handle_request(self, action: str, raw: str) -> None:
-        """Every ``bridge/request/<action>`` is refused in this version."""
+        """``schedule/get`` (every thermostat) and ``schedule/set`` (the designated ones).
+
+        Every request is answered on ``bridge/response/<action>``, whatever happens.
+        """
         try:
             payload = json.loads(raw)
         except (TypeError, ValueError):
             payload = None
         transaction = payload.get("transaction") if isinstance(payload, dict) else None
-        self._respond(action, error=REQUEST_ERROR, transaction=transaction)
+        name = payload.get("device") if isinstance(payload, dict) else None
+        data: dict[str, Any] = {"device": name} if isinstance(name, str) else {}
+        try:
+            error = self._request_refusal(action, payload)
+            if error is not None:
+                log.info("request refused: %s", error.split(";")[0])
+                self._respond(action, data=data, error=error, transaction=transaction)
+                return
+            assert isinstance(payload, dict) and isinstance(name, str)
+            dev_id = next(d for d, known in self.names.items() if known == name)
+            if action == "schedule/get":
+                self._serve_get(dev_id, data, transaction)
+            else:
+                self._serve_set(dev_id, payload["days"], data, transaction)
+        except Exception as err:  # the answer must come, whatever broke
+            log.error("request %s failed unexpectedly (%s)", action, type(err).__name__)
+            self._respond(
+                action,
+                data=data,
+                error=f"internal error ({type(err).__name__}); read the schedule before trusting it",
+                transaction=transaction,
+            )
+
+    def _request_refusal(self, action: str, payload: Any) -> str | None:
+        """Why a request is refused before the library sees it, or ``None``."""
+        if action not in REQUESTS:
+            return f"unknown request {action!r}; {NOTHING_SENT}"
+        if not isinstance(payload, dict):
+            return f"payload is not a JSON object; {NOTHING_SENT}"
+        name = payload.get("device")
+        dev_id = next((d for d, known in self.names.items() if known == name), None)
+        if dev_id is None:
+            return f"unknown device; {NOTHING_SENT}"
+        if action == "schedule/get":
+            reason = self._developer_closed()
+            return None if reason is None else f"schedule unavailable: {reason}; {NOTHING_SENT}"
+        reason = self.schedule_closed_reason()
+        if reason is not None:
+            return f"schedule read only: {reason}; {NOTHING_SENT}"
+        if dev_id not in self._designated():
+            return f"writes are open for the designated thermostats only; {NOTHING_SENT}"
+        days = payload.get("days")
+        if not isinstance(days, dict) or not days:
+            return f"'days' must be an object holding at least one day; {NOTHING_SENT}"
+        unknown = [day for day in days if day not in schedule.DAYS]
+        if unknown:
+            return f"unknown day {unknown[0]!r} (monday to sunday); {NOTHING_SENT}"
+        limited = self._rate_refusal(dev_id)
+        return None if limited is None else f"{limited}; {NOTHING_SENT}"
+
+    def _serve_get(self, dev_id: str, data: dict[str, Any], transaction: Any) -> None:
+        assert self.developer is not None
+        try:
+            week = self.developer.read_schedule(dev_id)
+        except PilotWireError as err:
+            self._respond("schedule/get", data=data, error=f"schedule: {err}", transaction=transaction)
+            return
+        self._keep_schedule(dev_id, week, self._clock())
+        if dev_id in self._schedule_changed:
+            self._schedule_changed.discard(dev_id)
+            self.publish_state(dev_id)
+        error = None if len(week) == len(schedule.DAYS) else "schedule: some days could not be read in full"
+        self._respond("schedule/get", data=data | {"schedule": week}, error=error, transaction=transaction)
+
+    def _serve_set(self, dev_id: str, days: dict[str, Any], data: dict[str, Any], transaction: Any) -> None:
+        self.gate.designated = frozenset(self._designated())
+        log.warning("WRITE: schedule (%s) asked for a designated thermostat", ", ".join(days))
+        try:
+            result = self.gate.write_schedule(self.devices[dev_id], days)
+        except PilotWireError as err:
+            self._respond("schedule/set", data=data, error=f"schedule: {err}", transaction=transaction)
+            return
+        if result.week:
+            self._keep_schedule(dev_id, result.week, self._clock())
+            if dev_id in self._schedule_changed:
+                self._schedule_changed.discard(dev_id)
+                self.publish_state(dev_id)
+        error = None if result.confirmed else f"schedule: not confirmed, {result.detail}"
+        log.warning("WRITE answered: %s", "not confirmed" if error else "confirmed")
+        self._respond(
+            "schedule/set",
+            data=data
+            | {
+                "days": list(result.days),
+                "written": len(result.written),
+                "confirmed": result.confirmed,
+                "schedule": result.week,
+            },
+            error=error,
+            transaction=transaction,
+        )
+        self.publish_info()
