@@ -206,7 +206,9 @@ is not part of `read_only`, it is checked per command.
 `transaction` is an identifier, not a command key. **Every** `/set` is answered on
 `<prefix>/bridge/response/device/set` (not retained). A reader that wants a manual setpoint sends
 `preset: "manual"`, waits for its answer, then sends the setpoint; to give the thermostat back
-to its weekly schedule, it sends `preset: "program"`.
+to its weekly schedule, it sends `preset: "program"`. Entering `manual` restores the setpoint the thermostat
+keeps for that mode, which can be far from the value read in `program` (21 °C was seen): the
+thermostat regulates on it until the setpoint command is confirmed.
 
 A command the bridge refuses without sending anything — read-only bridge, unknown device, no key,
 two keys, a key other than the two above, a thermostat that is not designated, a `preset` other
@@ -273,8 +275,8 @@ Routes of the commands:
 
 | Command | Route | State |
 |---|---|---|
-| `{"current_heating_setpoint": 19.5}` | sharing API | proven on one thermostat in `manual` mode (2026-10-31); **open for the designated thermostats, in `manual` mode only** |
-| `{"preset": "manual" \| "program"}` | sharing API | proven on one thermostat (2026-10-31); **open for the designated thermostats** |
+| `{"current_heating_setpoint": 19.5}` | sharing API | proven on one thermostat in `manual` mode (2026-10-31), then through this bridge on two thermostats (2026-11-28, [trial 2](https://github.com/aghulas/ha-tuya-pilot-wire/blob/main/docs/validation/2026-11-28-trial-2-preset-and-setpoint.md)); **open for the designated thermostats, in `manual` mode only** |
+| `{"preset": "manual" \| "program"}` | sharing API | proven on one thermostat (2026-10-31), then through this bridge on two thermostats (2026-11-28, same trial); **open for the designated thermostats** |
 | `{"preset": "eco" \| "holiday"}` | sharing API | written once (2026-10-31); closed: the setpoint the device then follows cannot be written |
 | `{"system_mode": "heat" \| "off"}` | sharing API | proven on one thermostat (2026-10-31); closed in this version |
 | `{"child_lock": …}`, `{"window_detection": …}`, `{"local_temperature_calibration": …}`, `{"holiday_temperature": …}` | sharing API | candidates, closed: declared by the device, never written |
